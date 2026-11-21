@@ -1,4 +1,4 @@
-name: Shopping Sessions unique UTC day Docker benchmark
+name: Shopping Sessions one-pass event Docker benchmark
 on:
   create:
   push:
@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: shopping-sessions-unique-utc-bench
+  group: shopping-sessions-onepass-bench
   cancel-in-progress: true
 jobs:
   benchmark:
@@ -22,7 +22,7 @@ jobs:
           cd ci
           git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
           git -C src worktree add --detach "$PWD/baseline" aae66c1975274fe8014875dea69f35bbc4ee5786
-          git -C src worktree add --detach "$PWD/candidate" 88f5b78425d93ee2bf4a8daff365f3ff7efcbd73
+          git -C src worktree add --detach "$PWD/candidate" 6b3079af79e431ca0ef4f64908b4454106ccfed8
           docker build --platform linux/amd64 -t shopping-sessions:baseline baseline
           docker build --platform linux/amd64 -t shopping-sessions:candidate candidate
           docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' shopping-sessions:baseline shopping-sessions:candidate
