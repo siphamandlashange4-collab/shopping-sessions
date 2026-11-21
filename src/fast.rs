@@ -248,7 +248,18 @@ fn collect_events(
                     let Some(id) = pack::<b'e'>(id) else {
                         return false;
                     };
-                    let ingest = ts::parse_ingest(ingest).unwrap_or(BAD_TS);
+                    let hash = rustc_hash::FxBuildHasher.hash_one(id);
+                    let slot = hash as usize & (slots - 1);
+                    let contested = collided[slot / 64] & (1_u64 << (slot % 64)) != 0;
+                    // Unique IDs use ingest time only for the lateness test.
+                    // Two timestamps on the same UTC date cannot be more
+                    // than 24 hours apart. Ingest is guaranteed to be valid
+                    // UTC, and event_fact still validates the event time.
+                    let ingest = if !contested && same_utc_date(time, ingest) {
+                        window.start
+                    } else {
+                        ts::parse_ingest(ingest).unwrap_or(BAD_TS)
+                    };
                     let fact = event_fact::<CompactFact>(
                         window,
                         &catalogs.products,
@@ -269,9 +280,7 @@ fn collect_events(
                         PackedName::default()
                     };
                     let event = SmallEvent { person, fact };
-                    let hash = rustc_hash::FxBuildHasher.hash_one(id);
-                    let slot = hash as usize & (slots - 1);
-                    if collided[slot / 64] & (1_u64 << (slot % 64)) != 0 {
+                    if contested {
                         possible[shard(hash)].push(Candidate { id, ingest, event });
                     } else {
                         route(event, links, &mut people);
@@ -323,6 +332,15 @@ fn collect_events(
         }
     }
     Some(groups)
+}
+
+#[inline]
+fn same_utc_date(time: &[u8], ingest: &[u8]) -> bool {
+    time.len() == 20
+        && ingest.len() == 20
+        && time[19] == b'Z'
+        && ingest[19] == b'Z'
+        && time[..10] == ingest[..10]
 }
 
 #[inline]
@@ -453,6 +471,15 @@ pub(super) fn try_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_day_shortcut_requires_matching_utc_date() {
+        let ingest = b"2028-02-29T23:59:59Z";
+        assert!(same_utc_date(b"2028-02-29T00:00:00Z", ingest));
+        assert!(!same_utc_date(b"2028-02-28T23:59:59Z", ingest));
+        assert!(!same_utc_date(b"2028-02-29T00:00:00+00:00", ingest));
+        assert!(!same_utc_date(b"1835395200000", ingest));
+    }
 
     #[test]
     fn slot_scan_covers_every_supported_event_id() {
