@@ -15,10 +15,27 @@ pub fn for_each<'a, const N: usize>(
         && std::arch::is_x86_feature_detected!("bmi2")
         && std::arch::is_x86_feature_detected!("popcnt")
     {
-        // All features used by the row decoder were checked above.
+        if std::arch::is_x86_feature_detected!("avx512bw") {
+            // The AVX-512BW path also uses the row decoder's features.
+            return unsafe { for_each_avx512(bytes, consume) };
+        }
         return unsafe { for_each_x86(bytes, consume) };
     }
     Rows::<N>::raw(bytes).all(&mut consume)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+#[inline]
+unsafe fn marks_64_avx512(ptr: *const u8) -> Marks {
+    use std::arch::x86_64::*;
+
+    let block = _mm512_loadu_si512(ptr.cast());
+    Marks {
+        newline: _mm512_cmpeq_epi8_mask(block, _mm512_set1_epi8(b'\n' as i8)),
+        comma: _mm512_cmpeq_epi8_mask(block, _mm512_set1_epi8(b',' as i8)),
+        quote: _mm512_cmpeq_epi8_mask(block, _mm512_set1_epi8(b'"' as i8)),
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -132,14 +149,33 @@ unsafe fn decode<const N: usize>(
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
 unsafe fn for_each_x86<'a, const N: usize>(
     bytes: &'a [u8],
+    consume: impl FnMut([&'a [u8]; N]) -> bool,
+) -> bool {
+    scan_rows(bytes, consume, |ptr| marks_64(ptr))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,avx512bw")]
+unsafe fn for_each_avx512<'a, const N: usize>(
+    bytes: &'a [u8],
+    consume: impl FnMut([&'a [u8]; N]) -> bool,
+) -> bool {
+    scan_rows(bytes, consume, |ptr| marks_64_avx512(ptr))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn scan_rows<'a, const N: usize>(
+    bytes: &'a [u8],
     mut consume: impl FnMut([&'a [u8]; N]) -> bool,
+    marks: impl Fn(*const u8) -> Marks,
 ) -> bool {
     let mut start = 0;
     let mut prior_comma = 0u128;
     let mut prior_quote = 0u128;
     for (index, block) in bytes.chunks_exact(64).enumerate() {
         let base = index * 64;
-        let Marks { mut newline, comma, quote } = marks_64(block.as_ptr());
+        let Marks { mut newline, comma, quote } = marks(block.as_ptr());
         let carried = base - start;
         if newline != 0 {
             let first = newline.trailing_zeros() as usize;

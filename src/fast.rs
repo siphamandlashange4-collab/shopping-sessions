@@ -133,18 +133,18 @@ struct SmallClick {
 }
 
 #[inline]
+fn comma_mask(word: u64) -> u64 {
+    let different = word ^ u64::from_le_bytes([b','; 8]);
+    // Borrow can mark bytes above the first match. The least significant
+    // marked byte is always the first comma.
+    different.wrapping_sub(0x0101_0101_0101_0101) & !different & 0x8080_8080_8080_8080
+}
+
+#[inline]
 fn first_comma(prefix: &[u8]) -> Option<usize> {
     let Ok(prefix) = <&[u8; 12]>::try_from(prefix) else {
         return memchr::memchr(b',', prefix);
     };
-
-    #[inline]
-    fn comma_mask(word: u64) -> u64 {
-        let different = word ^ u64::from_le_bytes([b','; 8]);
-        // Borrow can mark bytes above the first match. The least significant
-        // marked byte is always the first comma.
-        different.wrapping_sub(0x0101_0101_0101_0101) & !different & 0x8080_8080_8080_8080
-    }
 
     let first = comma_mask(u64::from_le_bytes(prefix[..8].try_into().unwrap()));
     if first != 0 {
@@ -152,6 +152,33 @@ fn first_comma(prefix: &[u8]) -> Option<usize> {
     }
     let last = comma_mask(u64::from_le_bytes(prefix[4..].try_into().unwrap()));
     (last != 0).then(|| 4 + last.trailing_zeros() as usize / 8)
+}
+
+#[inline]
+fn event_id_prefix(prefix: &[u8]) -> Option<u64> {
+    if let Ok(prefix) = <&[u8; 12]>::try_from(prefix) {
+        // Check the expected delimiters first for full-width packed IDs. An
+        // earlier comma means the actual first field is shorter.
+        let full_id = match prefix {
+            [b'"', first @ (b'e' | b'E'), suffix @ .., b'"', b','] => Some((*first, suffix)),
+            [first @ (b'e' | b'E'), suffix @ .., b',', _, _] => Some((*first, suffix)),
+            _ => None,
+        };
+        if let Some((first, suffix)) = full_id {
+            let word = u64::from_le_bytes(*suffix);
+            if comma_mask(word) == 0 && matches!(word >> 56, 1..=127) {
+                return Some(word | (u64::from(first == b'E') << 63));
+            }
+        }
+    }
+
+    let comma = first_comma(prefix)?;
+    let field = &prefix[..comma];
+    let id = field
+        .strip_prefix(b"\"")
+        .and_then(|field| field.strip_suffix(b"\""))
+        .unwrap_or(field);
+    pack::<b'e'>(id)
 }
 
 fn scan_slots(chunks: &[&[u8]], slots: usize) -> Buckets<u32> {
@@ -165,15 +192,7 @@ fn scan_slots(chunks: &[&[u8]], slots: usize) -> Buckets<u32> {
             // here. Only the full CSV pass can admit an event.
             let prefix = &chunk[start..end.min(start + 12)];
             start = end + 1;
-            let Some(comma) = first_comma(prefix) else {
-                continue;
-            };
-            let field = &prefix[..comma];
-            let id = field
-                .strip_prefix(b"\"")
-                .and_then(|field| field.strip_suffix(b"\""))
-                .unwrap_or(field);
-            if let Some(id) = pack::<b'e'>(id) {
+            if let Some(id) = event_id_prefix(prefix) {
                 let slot = rustc_hash::FxBuildHasher.hash_one(id) as usize & (slots - 1);
                 buckets[slot >> shift].push(slot as u32);
             }
@@ -457,7 +476,7 @@ mod tests {
     #[test]
     fn slot_scan_covers_every_supported_event_id() {
         let chunks = [
-            &b"e1,,,x,y,z,t\n\"e12345678\",u,t,i,k,p,p\n\"e1\",u,t,i,k,p,p\n"[..],
+            &b"e1,u00000,t,i,k,p,p\n\"e12345678\",u,t,i,k,p,p\n\"e1\",u,t,i,k,p,p\n"[..],
             &b"\"E12345678\",u,t,i,k,p,p\ninvalid\ne12345678,u,t,i,k,p,p"[..],
         ];
         let slots = 4096;
