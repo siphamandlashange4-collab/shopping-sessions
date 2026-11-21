@@ -22,18 +22,18 @@ cost: the clock runs from container start to container exit.
 3. **Timestamps** are parsed by hand for the three accepted forms (F1 UTC, F2
    offset, F3 epoch millis), with full calendar validation including leap years.
    An F3 value too large for `i64` is treated as valid but outside the window.
-4. **Dedup** events on `event_id`, keeping the smallest `ingest_ts`, *before*
-   validation, so an invalid kept copy drops the event.
-5. **Link** user IDs with union-find (path halving, union by rank); each person
-   is named by the byte-wise smallest ID in their component.
-6. **Sessionize** each person's events sorted by `ts`, starting a session when
-   the gap exceeds 30 minutes. Equal timestamps share a session naturally.
-7. **Attribute** each session by binary search over that person's clicks sorted
-   by `(ts, click_id)`: the latest click at or before the session start, within
-   7 days, ties broken by the smallest `click_id`. Assists are the distinct
-   campaigns in the same window.
-8. **Aggregate** with sorts and linear scans. Category IDs are interned in
-   byte order, so the top-category tie-break is a simple minimum.
+4. **Dedup** events in independent ID shards. Every well-formed copy takes
+   part in the earliest-ingest selection, so an invalid winner drops the event.
+5. **Link** user IDs with union-find. Each person is named by the byte-wise
+   smallest ID in their component. Events and clicks are routed by that name.
+6. **Sessionize** in parallel by person shard. Count events by person to group
+   them in linear time, then sort each person's slice by timestamp. Start a new
+   session when the gap exceeds 30 minutes.
+7. **Attribute** sessions with a sliding seven-day click window. The latest
+   qualifying time and smallest click ID determine credit. Counts per campaign
+   keep each active campaign's assist contribution to one per session.
+8. **Aggregate** user days and campaign totals while walking the sessions.
+   Write the user Parquet parts in parallel, then merge the campaign totals.
 
 ## Libraries
 
