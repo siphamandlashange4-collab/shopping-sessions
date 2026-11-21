@@ -3,8 +3,8 @@
 
 use super::{
     attribution::{CampaignTable, Click},
-    chunks, csv, event_fact, exchange, find_root, group_facts, shard, summarize, ts, write_results,
-    Buckets, Catalogs, CompactFact, Fact, OutputName, UserRows, Window, BAD_TS, ORGANIC,
+    chunks, csv, event_fact_at, exchange, find_root, group_facts, shard, summarize, ts, write_results,
+    Buckets, Catalogs, CompactFact, Fact, OutputName, UserRows, Window, ORGANIC,
     SEVEN_DAYS_MS, SHARDS,
 };
 use arrow_array::StringArray;
@@ -173,7 +173,9 @@ struct SmallEvent {
 #[derive(Clone, Copy)]
 struct Candidate {
     key: u64,
-    ingest: i64,
+    // Valid F1 timestamps sort chronologically as bytes. Keep a thin
+    // reference and touch it for deduplication only when a real ID repeats.
+    ingest: &'static [u8; 20],
     event: SmallEvent,
 }
 
@@ -259,6 +261,7 @@ fn collect_candidates(
     window: &Window,
     catalogs: &Catalogs,
 ) -> Option<(CandidatePartitions, usize)> {
+    let deadlines = ts::IngestDeadlines::new(window.start, window.end)?;
     let mut chunks = chunks(buffers);
     let bytes = chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
     let slots = (bytes / 16)
@@ -285,18 +288,28 @@ fn collect_candidates(
                     let Some(id) = pack::<b'e'>(id) else {
                         return false;
                     };
-                    let ingest = ts::parse_ingest(ingest).unwrap_or(BAD_TS);
-                    let fact = event_fact::<CompactFact>(
-                        window,
-                        &catalogs.products,
-                        catalogs.unknown_category,
-                        person,
-                        time,
-                        ingest,
-                        kind,
-                        product,
-                        price,
-                    );
+                    let Ok(ingest) = <&[u8; 20]>::try_from(ingest) else {
+                        return false;
+                    };
+                    if ingest[19] != b'Z' {
+                        return false;
+                    }
+                    let fact = if person.is_empty() || product.is_empty() {
+                        CompactFact::INVALID
+                    } else {
+                        match ts::parse(time).filter(|time| (window.start..window.end).contains(time)) {
+                            Some(time) if deadlines.allows(time, ingest) => event_fact_at::<CompactFact>(
+                                window,
+                                &catalogs.products,
+                                catalogs.unknown_category,
+                                time,
+                                kind,
+                                product,
+                                price,
+                            ),
+                            _ => CompactFact::INVALID,
+                        }
+                    };
                     let person = if fact.valid() {
                         let Some(person) = PackedName::parse(person) else {
                             return false;
@@ -484,14 +497,14 @@ mod tests {
         };
         let pieces = vec![
             vec![
-                candidate(10, 20, CompactFact(100)),
-                candidate(74, 30, CompactFact(200)),
-                candidate(11, 40, CompactFact(300)),
+                candidate(10, b"2026-10-01T00:00:20Z", CompactFact(100)),
+                candidate(74, b"2026-10-01T00:00:30Z", CompactFact(200)),
+                candidate(11, b"2026-10-01T00:00:40Z", CompactFact(300)),
             ],
             vec![
-                candidate(10, 10, CompactFact::INVALID),
-                candidate(74, 15, CompactFact(400)),
-                candidate(138, 20, CompactFact(500)),
+                candidate(10, b"2026-10-01T00:00:10Z", CompactFact::INVALID),
+                candidate(74, b"2026-10-01T00:00:15Z", CompactFact(400)),
+                candidate(138, b"2026-10-01T00:00:20Z", CompactFact(500)),
             ],
         ];
         let links = PackedLinks(FxHashMap::default());

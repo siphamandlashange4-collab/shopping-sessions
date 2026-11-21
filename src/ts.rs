@@ -182,16 +182,85 @@ fn parse_calendar(s: &[u8]) -> Option<i64> {
     }
 }
 
-/// Ingest timestamps are guaranteed to be valid UTC whole seconds.
-#[inline]
-pub fn parse_ingest(s: &[u8]) -> Option<i64> {
-    let Ok(s) = <&[u8; 20]>::try_from(s) else {
-        return parse(s);
-    };
-    let ym = u64::from_le_bytes(s[..8].try_into().unwrap());
-    let dhm = u64::from_le_bytes(s[8..16].try_into().unwrap());
-    let sec = two_digits(u16::from_le_bytes([s[17], s[18]]) as u64);
-    calendar_millis(ym, dhm, sec)
+/// Calendar dates of the 24-hour deadlines in the event window.
+///
+/// Ingest timestamps are guaranteed to be valid F1. A deadline on tomorrow's
+/// UTC date rules out lateness for an ingest dated today or earlier. Only an
+/// ingest on the deadline date needs its hours, minutes and seconds decoded.
+pub struct IngestDeadlines {
+    midnight_ms: i64,
+    dates: Vec<(u64, u16)>,
+}
+
+impl IngestDeadlines {
+    const DAY_MS: i64 = 86_400_000;
+
+    pub fn new(start: i64, end: i64) -> Option<Self> {
+        let first = start.div_euclid(Self::DAY_MS);
+        let last = end.checked_sub(1)?.div_euclid(Self::DAY_MS);
+        let midnight_ms = first.checked_mul(Self::DAY_MS)?;
+        // Limit this table to the compact path's roughly 25-day window.
+        if last < first || last - first > 25 {
+            return None;
+        }
+        let dates = (first..=last).map(|day| date_prefix(day + 1)).collect();
+        Some(Self { midnight_ms, dates })
+    }
+
+    /// The caller has already accepted time into the configured window.
+    #[inline]
+    pub fn allows(&self, time: i64, ingest: &[u8; 20]) -> bool {
+        let offset = (time - self.midnight_ms) as u64;
+        let day = offset / Self::DAY_MS as u64;
+        let (cutoff_month, cutoff_day) = self.dates[day as usize];
+        let ingest_month = u64::from_be_bytes(ingest[..8].try_into().unwrap());
+        if ingest_month != cutoff_month {
+            return ingest_month < cutoff_month;
+        }
+
+        let ingest_day = u16::from_be_bytes([ingest[8], ingest[9]]);
+        if ingest_day != cutoff_day {
+            return ingest_day < cutoff_day;
+        }
+
+        let pairs = decimal_pairs(u64::from_le_bytes(ingest[11..19].try_into().unwrap()));
+        let hour = pairs as u8 as u32;
+        let minute = (pairs >> 24) as u8 as u32;
+        let second = (pairs >> 48) as u8 as u32;
+        let ingest_clock = ((hour * 60 + minute) * 60 + second) as u64 * 1000;
+        ingest_clock <= offset - day * Self::DAY_MS as u64
+    }
+}
+
+fn date_prefix(day: i64) -> (u64, u16) {
+    let first = i64::from(MONTH_INFO[0][1] >> 5);
+    let december = MONTH_INFO[9999][12];
+    let last = i64::from((december >> 5) + (december & 31) - 1);
+    if day < first {
+        return (0, 0);
+    }
+    if day > last {
+        return (u64::MAX, u16::MAX);
+    }
+
+    let year = MONTH_INFO.partition_point(|info| i64::from(info[1] >> 5) <= day) - 1;
+    let months = &MONTH_INFO[year][1..=12];
+    let month = months.partition_point(|info| i64::from(info >> 5) <= day);
+    let date = (day - i64::from(MONTH_INFO[year][month] >> 5)) as u8 + 1;
+    let month = month as u8;
+    let digit = |digit| b'0' + digit as u8;
+    let prefix = u64::from_be_bytes([
+        digit(year / 1000),
+        digit(year / 100 % 10),
+        digit(year / 10 % 10),
+        digit(year % 10),
+        b'-',
+        b'0' + month / 10,
+        b'0' + month % 10,
+        b'-',
+    ]);
+    let date = u16::from_be_bytes([b'0' + date / 10, b'0' + date % 10]);
+    (prefix, date)
 }
 
 #[inline]
@@ -222,6 +291,47 @@ pub fn day_of(ms: i64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_deadlines_match_epoch_subtraction_at_day_and_calendar_edges() {
+        for (time, first, next, last) in [
+            (
+                b"2028-02-28T23:59:59Z",
+                b"2028-02-28T23:59:59Z",
+                b"2028-02-29T23:59:59Z",
+                b"2028-03-01T00:00:00Z",
+            ),
+            (
+                b"1999-12-31T20:10:05Z",
+                b"1999-12-31T23:59:59Z",
+                b"2000-01-01T20:10:05Z",
+                b"2000-01-01T20:10:06Z",
+            ),
+            (
+                b"0000-01-01T00:00:00Z",
+                b"0000-01-01T00:00:00Z",
+                b"0000-01-02T00:00:00Z",
+                b"0000-01-02T00:00:01Z",
+            ),
+            (
+                b"9999-12-31T00:00:00Z",
+                b"9999-01-01T00:00:00Z",
+                b"9999-12-31T00:00:00Z",
+                b"9999-12-31T23:59:59Z",
+            ),
+        ] {
+            let time = parse(time).unwrap();
+            let cutoffs = IngestDeadlines::new(time - 123, time + 2000).unwrap();
+            for event in [time - 1, time, time + 1, time + 999, time + 1000] {
+                for ingest in [first, next, last] {
+                    assert_eq!(
+                        cutoffs.allows(event, ingest),
+                        parse(ingest).unwrap() - event <= IngestDeadlines::DAY_MS
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn forms_agree() {

@@ -485,6 +485,19 @@ fn event_fact<F: Fact>(
     if ingest - time > LATE_MS {
         return F::INVALID;
     }
+    event_fact_at(window, products, unknown, time, kind, product, price)
+}
+
+#[inline]
+fn event_fact_at<F: Fact>(
+    window: &Window,
+    products: &FxHashMap<&'static [u8], u32>,
+    unknown: u32,
+    time: i64,
+    kind: &[u8],
+    product: &[u8],
+    price: &[u8],
+) -> F {
     match kind {
         b"view" | b"cart" => F::encode(window, time, 0, 0),
         b"purchase" if csv::all_digits(price) => {
