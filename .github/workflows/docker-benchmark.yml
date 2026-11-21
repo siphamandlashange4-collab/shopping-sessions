@@ -1,0 +1,90 @@
+name: Shopping Sessions Docker benchmark
+on:
+  create:
+  push:
+    branches: [buildathon-docker-bench]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: shopping-sessions-docker-bench
+  cancel-in-progress: true
+jobs:
+  benchmark:
+    if: github.ref == 'refs/heads/buildathon-docker-bench'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Build both unmodified Linux images
+        shell: bash
+        run: |
+          mkdir ci
+          cd ci
+          git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
+          git -C src worktree add --detach "$PWD/baseline" 1f746986a92aa2aad1a82833e5fd05df4c06b5ea
+          git -C src worktree add --detach "$PWD/candidate" aae66c1975274fe8014875dea69f35bbc4ee5786
+          docker build --platform linux/amd64 -t shopping-sessions:baseline baseline
+          docker build --platform linux/amd64 -t shopping-sessions:candidate candidate
+          docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' shopping-sessions:baseline shopping-sessions:candidate
+          nproc
+          lscpu | sed -n '/Model name/p'
+          free -h
+          df -h .
+      - name: Generate official dev and synthetic practice-scale inputs
+        shell: bash
+        run: |
+          cd ci
+          files=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for file in generator.zip dev-answer.zip starter-polars.zip; do
+            curl --fail --silent --show-error --location --retry 2 "$files/$file" -o "$file"
+          done
+          sha256sum -c <<'EOF'
+          13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  generator.zip
+          7eb8e1f0b1f431d178d28ac9437ce85809c44eb6393fdd42fb59857f30834fa9  dev-answer.zip
+          EOF
+          for zip in *.zip; do unzip -q "$zip"; done
+          cargo build --locked --release --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+          generator/target/release/generate --seed 41 --events 20000000 --clicks 5000000 --output practice
+          python3 -m venv .venv
+          .venv/bin/pip install -q -r starter-polars/requirements.txt
+      - name: Verify dev output and time interleaved practice runs
+        shell: bash
+        run: |
+          cd ci
+          export CPUS=4 MEM=12g PLATFORM=linux/amd64
+          comparer=(.venv/bin/python starter-polars/scripts/compare.py)
+          runner=starter-polars/scripts/docker_run.sh
+          for version in baseline candidate; do
+            IMAGE="shopping-sessions:$version" sh "$runner" dev "out-dev-$version"
+            "${comparer[@]}" "out-dev-$version" dev-answer
+          done
+          for version in baseline candidate; do
+            IMAGE="shopping-sessions:$version" sh "$runner" practice "out-practice-$version"
+          done
+          "${comparer[@]}" out-practice-baseline out-practice-candidate
+          mkdir timed-output
+          for cycle in {1..6}; do
+            if (( cycle % 2 )); then
+              order=(baseline candidate)
+            else
+              order=(candidate baseline)
+            fi
+            for version in "${order[@]}"; do
+              export IMAGE="shopping-sessions:$version"
+              /usr/bin/time -f "$version %e" -a -o timings.txt sh "$runner" practice timed-output
+            done
+          done
+          cat timings.txt
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from collections import defaultdict
+          from statistics import median
+          times = defaultdict(list)
+          for line in open("timings.txt"):
+              name, seconds = line.split()
+              times[name].append(float(seconds))
+          print("Docker medians on the same ubuntu-24.04 runner, 4 vCPUs and 12 GB, 20M generated events")
+          for name, values in times.items():
+              print(f"- {name}: {median(values):.3f}s median ({len(values)} runs)")
+          print(f"- Runtime reduction: {1 - median(times['candidate']) / median(times['baseline']):.1%}")
+          PY
