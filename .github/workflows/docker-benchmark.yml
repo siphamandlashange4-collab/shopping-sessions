@@ -1,4 +1,4 @@
-name: Shopping Sessions Docker benchmark
+name: Shopping Sessions Docker follow-up benchmark
 on:
   create:
   push:
@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: shopping-sessions-docker-bench
+  group: shopping-sessions-docker-bench-followup
   cancel-in-progress: true
 jobs:
   benchmark:
@@ -21,8 +21,8 @@ jobs:
           mkdir ci
           cd ci
           git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
-          git -C src worktree add --detach "$PWD/baseline" 1f746986a92aa2aad1a82833e5fd05df4c06b5ea
-          git -C src worktree add --detach "$PWD/candidate" aae66c1975274fe8014875dea69f35bbc4ee5786
+          git -C src worktree add --detach "$PWD/baseline" aae66c1975274fe8014875dea69f35bbc4ee5786
+          git -C src worktree add --detach "$PWD/candidate" d30ef9bae1ec9b0581b36f853104f293518d7514
           docker build --platform linux/amd64 -t shopping-sessions:baseline baseline
           docker build --platform linux/amd64 -t shopping-sessions:candidate candidate
           docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' shopping-sessions:baseline shopping-sessions:candidate
