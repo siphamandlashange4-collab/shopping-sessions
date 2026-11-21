@@ -1,4 +1,4 @@
-name: Shopping Sessions optimized compiler build benchmark
+name: Shopping Sessions raw ingest deadline benchmark
 on:
   create:
   push:
@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: shopping-sessions-onepass-pgo-bench
+  group: shopping-sessions-raw-ingest-bench
   cancel-in-progress: true
 jobs:
   benchmark:
@@ -22,7 +22,7 @@ jobs:
           cd ci
           git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
           git -C src worktree add --detach "$PWD/baseline" 80a86150b180280c1cd5115ffc0985add9532ef5
-          git -C src worktree add --detach "$PWD/candidate" 2488b0505615618b457744772e90e138aa695e58
+          git -C src worktree add --detach "$PWD/candidate" 8e53257b142e5f37a87e0f37583852f0fba4fea0
           docker build --platform linux/amd64 -t shopping-sessions:baseline baseline
           docker build --platform linux/amd64 -t shopping-sessions:candidate candidate
           docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' shopping-sessions:baseline shopping-sessions:candidate
@@ -87,6 +87,8 @@ jobs:
             done
           }
           benchmark practice 6
+          generator/target/release/generate --seed 95 --events 20000000 --clicks 5000000 --output alternate
+          benchmark alternate 3
           generator/target/release/generate --seed 77 --events 60000000 --clicks 15000000 --output final-data
           benchmark final-data 4
           cat timings.txt
@@ -97,7 +99,7 @@ jobs:
           for line in open("timings.txt"):
               dataset, name, seconds = line.split()
               times[dataset, name].append(float(seconds))
-          for dataset in ("practice", "final-data"):
+          for dataset in ("practice", "alternate", "final-data"):
               baseline = median(times[dataset, "baseline"])
               candidate = median(times[dataset, "candidate"])
               print(f"{dataset}: baseline {baseline:.3f}s, candidate {candidate:.3f}s, reduction {1-candidate/baseline:.1%}")
