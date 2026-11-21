@@ -131,44 +131,57 @@ unsafe fn decode<const N: usize>(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
 unsafe fn for_each_x86<'a, const N: usize>(
-    mut bytes: &'a [u8],
+    bytes: &'a [u8],
     mut consume: impl FnMut([&'a [u8]; N]) -> bool,
 ) -> bool {
-    while bytes.len() >= 128 {
-        // At least two 64-byte probes are available. The first set bit in a
-        // newline mask points to an in-bounds end of this row.
-        let low = marks_64(bytes.as_ptr());
-        let (len, comma, quote) = if low.newline != 0 {
-            (low.newline.trailing_zeros() as usize, low.comma as u128, low.quote as u128)
-        } else {
-            let high = marks_64(bytes.as_ptr().add(64));
-            if high.newline == 0 {
-                let Some(len) = memchr::memchr(b'\n', &bytes[128..]).map(|n| n + 128) else {
-                    return split_n(bytes).is_none_or(&mut consume);
-                };
-                if let Some(fields) = split_n(&bytes[..len]) {
+    let mut start = 0;
+    let mut prior_comma = 0u128;
+    let mut prior_quote = 0u128;
+    for (index, block) in bytes.chunks_exact(64).enumerate() {
+        let base = index * 64;
+        let Marks { mut newline, comma, quote } = marks_64(block.as_ptr());
+        let carried = base - start;
+        if newline != 0 {
+            let first = newline.trailing_zeros() as usize;
+            let end = base + first;
+            let line = bytes.get_unchecked(start..end);
+            let fields = if line.len() < 128 {
+                decode(
+                    line,
+                    prior_comma | ((comma as u128) << carried),
+                    prior_quote | ((quote as u128) << carried),
+                )
+            } else {
+                split_n(line)
+            };
+            if let Some(fields) = fields {
+                if !consume(fields) {
+                    return false;
+                }
+            }
+            start = end + 1;
+            newline &= newline - 1;
+            while newline != 0 {
+                let end = base + newline.trailing_zeros() as usize;
+                let shift = start - base;
+                let line = bytes.get_unchecked(start..end);
+                if let Some(fields) = decode(line, (comma >> shift) as u128, (quote >> shift) as u128) {
                     if !consume(fields) {
                         return false;
                     }
                 }
-                bytes = &bytes[len + 1..];
-                continue;
+                start = end + 1;
+                newline &= newline - 1;
             }
-            (
-                high.newline.trailing_zeros() as usize + 64,
-                low.comma as u128 | (high.comma as u128) << 64,
-                low.quote as u128 | (high.quote as u128) << 64,
-            )
-        };
-        let line = bytes.get_unchecked(..len);
-        if let Some(fields) = decode(line, comma, quote) {
-            if !consume(fields) {
-                return false;
-            }
+            let shift = start - base;
+            prior_comma = comma.checked_shr(shift as u32).unwrap_or(0) as u128;
+            prior_quote = quote.checked_shr(shift as u32).unwrap_or(0) as u128;
+        } else if carried < 128 {
+            prior_comma |= (comma as u128) << carried;
+            prior_quote |= (quote as u128) << carried;
         }
-        bytes = bytes.get_unchecked(len + 1..);
     }
-    Rows::<N>::raw(bytes).all(consume)
+    Rows::<N>::raw(bytes.get_unchecked(start..)).all(consume)
 }
 
 #[cfg(test)]

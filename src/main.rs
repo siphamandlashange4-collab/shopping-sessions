@@ -709,7 +709,7 @@ fn aggregate<F: Fact>(
         counts[user] += 1;
         named_events.push((user, event.fact));
     }
-    let (events, offsets) = group_facts(counts, named_events);
+    let (events, offsets) = group_facts(counts, named_events.len(), named_events);
     let clicks: Vec<_> = click_parts
         .into_iter()
         .flatten()
@@ -738,7 +738,11 @@ fn aggregate<F: Fact>(
 }
 
 // Group by the dense person ID in linear time, then sort only within people.
-fn group_facts<F: Fact>(counts: Vec<usize>, named_events: Vec<(usize, F)>) -> (Vec<F>, Vec<usize>) {
+fn group_facts<F: Fact>(
+    counts: Vec<usize>,
+    len: usize,
+    named_events: impl IntoIterator<Item = (usize, F)>,
+) -> (Vec<F>, Vec<usize>) {
     let mut end = 0;
     let mut offsets: Vec<_> = counts
         .into_iter()
@@ -748,7 +752,7 @@ fn group_facts<F: Fact>(counts: Vec<usize>, named_events: Vec<(usize, F)>) -> (V
             start
         })
         .collect();
-    let mut events = vec![F::default(); named_events.len()];
+    let mut events = vec![F::default(); len];
     for (user, event) in named_events {
         events[offsets[user]] = event;
         offsets[user] += 1;

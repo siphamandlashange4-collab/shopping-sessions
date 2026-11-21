@@ -156,22 +156,8 @@ fn parse_calendar(s: &[u8]) -> Option<i64> {
         return None;
     }
 
-    let ym = decimal_pairs(ym);
-    let dhm = decimal_pairs(dhm);
-    let year = ym as u8 as usize * 100 + (ym >> 16) as u8 as usize;
-    let month = (ym >> 40) as u8 as usize;
-    let day = (dhm as u8 as u32).wrapping_sub(1);
-    let hour = (dhm >> 24) as u8 as u32;
-    let min = (dhm >> 48) as u8 as u32;
-    let sec = ((s[17] - b'0') as u32) * 10 + (s[18] - b'0') as u32;
-
-    let &month_info = MONTH_INFO[year].get(month)?;
-    if day >= (month_info as u32 & 31) || hour > 23 || min > 59 || sec > 59 {
-        return None;
-    }
-
-    let days = (month_info >> 5) + day as i32;
-    let base = days as i64 * 86_400_000 + ((hour * 60 + min) * 60 + sec) as i64 * 1000;
+    let sec = two_digits(u16::from_le_bytes([s[17], s[18]]) as u64);
+    let base = calendar_millis(ym, dhm, sec)?;
     if s.len() == 20 {
         return (s[19] == b'Z').then_some(base);
     }
@@ -194,6 +180,37 @@ fn parse_calendar(s: &[u8]) -> Option<i64> {
         b'-' => Some(base + offset),
         _ => None,
     }
+}
+
+/// Ingest timestamps are guaranteed to be valid UTC whole seconds.
+#[inline]
+pub fn parse_ingest(s: &[u8]) -> Option<i64> {
+    let Ok(s) = <&[u8; 20]>::try_from(s) else {
+        return parse(s);
+    };
+    let ym = u64::from_le_bytes(s[..8].try_into().unwrap());
+    let dhm = u64::from_le_bytes(s[8..16].try_into().unwrap());
+    let sec = two_digits(u16::from_le_bytes([s[17], s[18]]) as u64);
+    calendar_millis(ym, dhm, sec)
+}
+
+#[inline]
+fn calendar_millis(ym: u64, dhm: u64, sec: u32) -> Option<i64> {
+    let ym = decimal_pairs(ym);
+    let dhm = decimal_pairs(dhm);
+    let year = ym as u8 as usize * 100 + (ym >> 16) as u8 as usize;
+    let month = (ym >> 40) as u8 as usize;
+    let day = (dhm as u8 as u32).wrapping_sub(1);
+    let hour = (dhm >> 24) as u8 as u32;
+    let min = (dhm >> 48) as u8 as u32;
+
+    let &month_info = MONTH_INFO.get(year)?.get(month)?;
+    if day >= (month_info as u32 & 31) || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+
+    let days = (month_info >> 5) + day as i32;
+    Some(days as i64 * 86_400_000 + ((hour * 60 + min) * 60 + sec) as i64 * 1000)
 }
 
 /// Floor division of epoch ms to a day number (Parquet DATE32).

@@ -22,9 +22,10 @@ cost: the clock runs from container start to container exit.
 3. **Timestamps** are parsed by hand for the three accepted forms (F1 UTC, F2
    offset, F3 epoch millis), with full calendar validation including leap years.
    An F3 value too large for `i64` is treated as valid but outside the window.
-4. **Dedup** events with exact ID comparisons. The compact path uses a hash-slot
-   bitmap to send uncontested IDs directly to their person. Potential copies
-   enter ID shards for exact earliest-ingest selection, including invalid
+4. **Dedup** events with exact ID comparisons. The compact path first scans
+   event IDs and marks contested hash slots in cache-sized partitions. The
+   full CSV pass sends uncontested events directly to their person and uses
+   exact earliest-ingest selection for contested slots, including invalid
    candidates. Other ID shapes use the full byte-string path.
 5. **Link** user IDs with union-find. Each person is named by the byte-wise
    smallest ID in their component. Events and clicks are routed by that name.
@@ -52,6 +53,9 @@ No code was reused from before the event.
 
     docker build -t shopping-sessions .
     docker run --rm -v "$PWD/dev:/data:ro" -v "$PWD/out:/output" shopping-sessions
+
+The image targets x86-64-v3 for the scorer's Xeon CPUs. Use
+`--build-arg PIPELINE_CPU=x86-64` to build for an older x86-64 host.
 
 Locally, without Docker:
 
