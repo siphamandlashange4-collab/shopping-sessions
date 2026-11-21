@@ -19,12 +19,15 @@ pub struct GroupedClicks {
 
 impl GroupedClicks {
     pub fn new(clicks: Vec<Click>, users: usize) -> Self {
-        let mut ends = vec![0; users];
+        let mut counts = vec![0; users];
         for click in &clicks {
-            ends[click.user as usize] += 1;
+            counts[click.user as usize] += 1;
         }
+        Self::from_counts(counts, clicks)
+    }
 
-        let mut next = Vec::with_capacity(users);
+    pub fn from_counts(mut ends: Vec<usize>, clicks: impl IntoIterator<Item = Click>) -> Self {
+        let mut next = Vec::with_capacity(ends.len());
         let mut end = 0;
         for count in &mut ends {
             next.push(end);
@@ -32,7 +35,7 @@ impl GroupedClicks {
             *count = end;
         }
 
-        let mut rows = vec![Click::default(); clicks.len()];
+        let mut rows = vec![Click::default(); end];
         for click in clicks {
             let offset = &mut next[click.user as usize];
             rows[*offset] = click;

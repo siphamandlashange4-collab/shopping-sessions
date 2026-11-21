@@ -722,6 +722,7 @@ fn aggregate<F: Fact>(
             })
         })
         .collect();
+    let clicks = GroupedClicks::new(clicks, offsets.len());
     let names = names
         .vals
         .into_iter()
@@ -810,12 +811,11 @@ fn summarize<F: Fact, N: OutputName>(
     mut events: Vec<F>,
     offsets: Vec<usize>,
     names: impl Iterator<Item = N>,
-    clicks: Vec<Click>,
+    mut clicks: GroupedClicks,
     categories: &[&'static str],
     campaign_count: usize,
     window: &Window,
 ) -> (UserRows<N>, CampaignTable) {
-    let mut clicks = GroupedClicks::new(clicks, offsets.len());
     let mut rows = UserRows::default();
     let mut campaign_totals = window.campaign_table(campaign_count);
     let mut attribution = Attribution::new(campaign_count);

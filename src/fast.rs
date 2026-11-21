@@ -2,7 +2,7 @@
 //! Unsupported ID shapes fall back to the full byte-string pipeline.
 
 use super::{
-    attribution::{CampaignTable, Click},
+    attribution::{CampaignTable, Click, GroupedClicks},
     chunks, csv, event_fact, exchange, group_facts, shard, summarize, ts, write_results, Buckets,
     Catalogs, CompactFact, Fact, LinkNames, OutputName, UserRows, Window, BAD_TS, ORGANIC,
     SEVEN_DAYS_MS, SHARDS,
@@ -380,7 +380,7 @@ fn collect_clicks(
 
 fn aggregate_small(
     parts: Vec<Vec<SmallEvent>>,
-    clicks: Vec<Vec<SmallClick>>,
+    mut clicks: Vec<Vec<SmallClick>>,
     window: &Window,
     catalogs: &Catalogs,
 ) -> (UserRows<PackedName>, CampaignTable) {
@@ -406,18 +406,30 @@ fn aggregate_small(
         .flatten()
         .map(|event| (event.person.0 as usize, event.fact));
     let (events, offsets) = group_facts(counts, len, facts);
-    let clicks = clicks
-        .into_iter()
-        .flatten()
-        .filter_map(|click| {
-            Some(Click {
-                user: *ids.get(&click.person)? as u32,
+    // Reuse the click buffers for dense IDs just as with events. A click
+    // without any surviving events for the person has no effect.
+    const NO_EVENTS: u64 = u64::MAX;
+    let mut click_counts = vec![0; names.len()];
+    for click in clicks.iter_mut().flatten() {
+        click.person.0 = match ids.get(&click.person) {
+            Some(&user) => {
+                click_counts[user] += 1;
+                user as u64
+            }
+            None => NO_EVENTS,
+        };
+    }
+    let clicks = GroupedClicks::from_counts(
+        click_counts,
+        clicks.into_iter().flatten().filter_map(|click| {
+            (click.person.0 != NO_EVENTS).then(|| Click {
+                user: click.person.0 as u32,
                 time: window.start + i64::from(click.offset_ms),
                 campaign: click.campaign,
                 id: click.id,
             })
-        })
-        .collect();
+        }),
+    );
     summarize(
         events,
         offsets,
