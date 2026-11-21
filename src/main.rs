@@ -92,48 +92,7 @@ fn map_log(path: &Path) -> Option<&'static [u8]> {
     if address == libc::MAP_FAILED || address.is_null() {
         return None;
     }
-    MAPPED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((address as usize, len));
     Some(unsafe { std::slice::from_raw_parts(address.cast(), len) })
-}
-
-/// Address ranges of the read-only input mappings.
-#[cfg(target_os = "linux")]
-static MAPPED: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
-
-/// Drop the page-table entries for a finished slice of a mapped input file.
-///
-/// Process exit would otherwise unmap every input page in one serial pass at
-/// the very end of the run. Releasing each chunk as soon as it is parsed does
-/// the same work in parallel while other threads are still parsing. The
-/// mapping is private and never written, so any later read of the range just
-/// maps the file's page-cache pages again. Slices that are not inside a known
-/// file mapping (small files read onto the heap) are left alone.
-pub(crate) fn release_input(bytes: &[u8]) {
-    #[cfg(target_os = "linux")]
-    {
-        const PAGE: usize = 4096;
-        let start = bytes.as_ptr() as usize;
-        let end = start + bytes.len();
-        let mapped = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
-        if !mapped.iter().any(|&(base, len)| start >= base && end <= base + len) {
-            return;
-        }
-        drop(mapped);
-        // Only whole pages inside the slice; neighbouring chunks share the
-        // pages at either edge.
-        let first = start.div_ceil(PAGE) * PAGE;
-        let last = end / PAGE * PAGE;
-        if last > first {
-            unsafe {
-                libc::madvise(first as *mut libc::c_void, last - first, libc::MADV_DONTNEED);
-            }
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = bytes;
 }
 
 fn read_file(path: &Path) -> &'static [u8] {

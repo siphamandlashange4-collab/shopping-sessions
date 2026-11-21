@@ -451,7 +451,6 @@ fn collect_candidates(
                     possible.push(shard(key), Candidate { key, ingest, event });
                     true
                 });
-                crate::release_input(chunk);
                 ok.then_some(possible)
             },
         )
@@ -517,9 +516,6 @@ fn collect_clicks(
             if !supported {
                 return None;
             }
-            // Click IDs still point into this chunk; a later read of one
-            // (only on a timestamp tie) simply maps the page in again.
-            crate::release_input(chunk);
             let mut people: [Vec<SmallClick>; SHARDS] =
                 std::array::from_fn(|_| Vec::with_capacity(parsed.len() / SHARDS * 5 / 4 + 16));
             const AHEAD: usize = 32;

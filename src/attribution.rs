@@ -62,8 +62,20 @@ impl GroupedClicks {
             *count = end;
         }
 
+        // Scatter each click into its person's range, prefetching the
+        // destination of the click sixteen rows ahead.
+        const AHEAD: usize = 16;
         let mut rows = vec![Click::default(); clicks.len()];
-        for click in clicks {
+        for index in 0..clicks.len() {
+            if let Some(ahead) = clicks.get(index + AHEAD) {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                    let at = next[ahead.user as usize].min(rows.len() - 1);
+                    _mm_prefetch(rows.as_ptr().add(at).cast::<i8>(), _MM_HINT_T0);
+                }
+            }
+            let click = clicks[index];
             let offset = &mut next[click.user as usize];
             rows[*offset] = click;
             *offset += 1;
