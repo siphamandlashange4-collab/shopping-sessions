@@ -1066,8 +1066,8 @@ fn main() {
 }
 
 fn run_pipeline<F: Fact>(data: &Path, outdir: &Path, window: &Window, catalogs: &Catalogs) {
-    let (links, (event_bufs, click_bufs)) = rayon::join(
-        || LinkNames::build(&read_dir_csvs(&data.join("links"))),
+    let (link_bufs, (event_bufs, click_bufs)) = rayon::join(
+        || read_dir_csvs(&data.join("links")),
         || {
             rayon::join(
                 || read_dir_csvs(&data.join("events")),
@@ -1076,10 +1076,11 @@ fn run_pipeline<F: Fact>(data: &Path, outdir: &Path, window: &Window, catalogs: 
         },
     );
     if CompactFact::fits(window, catalogs.categories.len())
-        && fast::try_pipeline(&event_bufs, &click_bufs, &links, window, catalogs, outdir).is_some()
+        && fast::try_pipeline(&event_bufs, &click_bufs, &link_bufs, window, catalogs, outdir).is_some()
     {
         return;
     }
+    let links = LinkNames::build(&link_bufs);
     let (events, clicks) = rayon::join(
         || {
             user_events::<F>(

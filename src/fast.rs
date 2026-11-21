@@ -3,8 +3,8 @@
 
 use super::{
     attribution::{CampaignTable, Click},
-    chunks, csv, event_fact, exchange, group_facts, shard, summarize, ts, write_results, Buckets,
-    Catalogs, CompactFact, Fact, LinkNames, OutputName, UserRows, Window, BAD_TS, ORGANIC,
+    chunks, csv, event_fact, exchange, find_root, group_facts, shard, summarize, ts, write_results,
+    Buckets, Catalogs, CompactFact, Fact, OutputName, UserRows, Window, BAD_TS, ORGANIC,
     SEVEN_DAYS_MS, SHARDS,
 };
 use arrow_array::StringArray;
@@ -53,6 +53,13 @@ impl PackedName {
         let suffix = self.0 & !UPPER_CASE;
         1 + ((64 - suffix.leading_zeros()) as usize).div_ceil(8)
     }
+
+    #[inline]
+    fn byte_order(self) -> (bool, u64) {
+        // U precedes u. The suffix is stored little endian, so its byte
+        // order becomes numeric order after swapping and clearing the case bit.
+        (self.0 & UPPER_CASE == 0, (self.0 & !UPPER_CASE).swap_bytes())
+    }
 }
 
 impl OutputName for PackedName {
@@ -92,23 +99,68 @@ impl OutputName for PackedName {
     }
 }
 
-struct PackedLinks(FxHashMap<PackedName, PackedName>);
+pub(super) struct PackedLinks(FxHashMap<PackedName, u64>);
 
 impl PackedLinks {
-    fn from_links(links: &LinkNames) -> Option<Self> {
-        let mut aliases =
-            FxHashMap::with_capacity_and_hasher(links.person.len(), Default::default());
-        for (&source, &(person, _)) in links.users.vals.iter().zip(&links.person) {
-            if source != person {
-                aliases.insert(PackedName::parse(source)?, PackedName::parse(person)?);
+    pub(super) fn build(buffers: &[&'static [u8]]) -> Option<Self> {
+        let parts: Vec<_> = chunks(buffers)
+            .into_par_iter()
+            .map(|chunk| {
+                let mut pairs = Vec::new();
+                let supported = csv::for_each::<2>(chunk, |[a, b]| {
+                    if a.is_empty() || b.is_empty() || a == b {
+                        return true;
+                    }
+                    let (Some(a), Some(b)) = (PackedName::parse(a), PackedName::parse(b)) else {
+                        return false;
+                    };
+                    pairs.push((a, b));
+                    true
+                });
+                supported.then_some(pairs)
+            })
+            .collect::<Option<_>>()?;
+        let endpoints = parts.iter().map(Vec::len).sum::<usize>() * 2;
+        let mut links = FxHashMap::with_capacity_and_hasher(endpoints, Default::default());
+        let mut parent = Vec::with_capacity(endpoints);
+        let mut rank = Vec::with_capacity(endpoints);
+        let mut smallest = Vec::with_capacity(endpoints);
+        for (a, b) in parts.into_iter().flatten() {
+            let [mut a, mut b] = [a, b].map(|name| {
+                let index = *links.entry(name).or_insert_with(|| {
+                    let index = parent.len() as u32;
+                    parent.push(index);
+                    rank.push(0u8);
+                    smallest.push(name);
+                    u64::from(index)
+                });
+                find_root(&mut parent, index as u32) as usize
+            });
+            if a == b {
+                continue;
+            }
+            if rank[a] > rank[b] {
+                std::mem::swap(&mut a, &mut b);
+            }
+            parent[a] = b as u32;
+            rank[b] += u8::from(rank[a] == rank[b]);
+            if smallest[a].byte_order() < smallest[b].byte_order() {
+                smallest[b] = smallest[a];
             }
         }
-        Some(Self(aliases))
+        // Reuse the interning map for aliases. Canonical names route to
+        // themselves on a miss, so no entry is needed for them.
+        links.retain(|&name, index| {
+            let representative = smallest[find_root(&mut parent, *index as u32) as usize];
+            *index = representative.0;
+            name != representative
+        });
+        Some(Self(links))
     }
 
     #[inline]
     fn canonical(&self, name: PackedName) -> PackedName {
-        self.0.get(&name).copied().unwrap_or(name)
+        PackedName(self.0.get(&name).copied().unwrap_or(name.0))
     }
 }
 
@@ -200,12 +252,13 @@ impl Candidate {
     }
 }
 
-fn collect_events(
+type CandidatePartitions = [Vec<Vec<Candidate>>; SHARDS];
+
+fn collect_candidates(
     buffers: &[&'static [u8]],
     window: &Window,
     catalogs: &Catalogs,
-    links: &PackedLinks,
-) -> Option<[Vec<Vec<SmallEvent>>; SHARDS]> {
+) -> Option<(CandidatePartitions, usize)> {
     let mut chunks = chunks(buffers);
     let bytes = chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
     let slots = (bytes / 16)
@@ -264,12 +317,9 @@ fn collect_events(
         })
         .collect::<Option<Vec<_>>>()?;
 
-    let routed = exchange(candidates)
-        .into_par_iter()
-        .map(|pieces| route_partition(pieces, slots / SHARDS / 64, links))
-        .collect();
-    Some(exchange(routed))
+    Some((exchange(candidates), slots / SHARDS / 64))
 }
+
 #[inline]
 fn route(mut event: SmallEvent, links: &PackedLinks, groups: &mut Buckets<SmallEvent>) {
     if event.fact.valid() {
@@ -377,19 +427,30 @@ fn aggregate_small(
 pub(super) fn try_pipeline(
     event_bufs: &[&'static [u8]],
     click_bufs: &[&'static [u8]],
-    links: &LinkNames,
+    link_bufs: &[&'static [u8]],
     window: &Window,
     catalogs: &Catalogs,
     outdir: &Path,
 ) -> Option<()> {
-    let links = PackedLinks::from_links(links)?;
-    let (events, clicks) = rayon::join(
-        || collect_events(event_bufs, window, catalogs, &links),
-        || collect_clicks(click_bufs, window, catalogs, &links),
+    // Parsing event candidates only needs the catalogs. Build the link
+    // components and parse clicks in parallel, then route the dedup winners.
+    let (candidates, linked_clicks) = rayon::join(
+        || collect_candidates(event_bufs, window, catalogs),
+        || {
+            let links = PackedLinks::build(link_bufs)?;
+            let clicks = collect_clicks(click_bufs, window, catalogs, &links)?;
+            Some((links, clicks))
+        },
     );
-    let parts = events?
+    let (candidates, words) = candidates?;
+    let (links, clicks) = linked_clicks?;
+    let routed = candidates
         .into_par_iter()
-        .zip(clicks?)
+        .map(|pieces| route_partition(pieces, words, &links))
+        .collect();
+    let parts = exchange(routed)
+        .into_par_iter()
+        .zip(clicks)
         .map(|(events, clicks)| aggregate_small(events, clicks, window, catalogs));
     write_results(outdir, catalogs, parts);
     Some(())
@@ -398,6 +459,21 @@ pub(super) fn try_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_links_choose_the_bytewise_smallest_name() {
+        let buffers = [
+            &b"a,b\nuz,ua\nua,ufoo\0a\nufoo\0a,ufoo\nuxy,ux\n"[..],
+            &b"a,b\nufoo,Ub\nuz,ufoo\n"[..],
+        ];
+        let links = PackedLinks::build(&buffers).unwrap();
+        let name = |bytes| PackedName::parse(bytes).unwrap().0;
+        for alias in [b"uz".as_slice(), b"ua", b"ufoo\0a", b"ufoo", b"Ub"] {
+            assert_eq!(links.canonical(PackedName(name(alias))).0, name(b"Ub"));
+        }
+        assert_eq!(links.canonical(PackedName(name(b"uxy"))).0, name(b"ux"));
+        assert!(PackedLinks::build(&[b"a,b\nua,external\n"]).is_none());
+    }
 
     #[test]
     fn hash_slot_collisions_keep_distinct_ids_and_earliest_copies() {
