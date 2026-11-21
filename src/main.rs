@@ -6,6 +6,8 @@
 mod attribution;
 mod csv;
 mod fast;
+mod plain_parquet;
+mod time_bins;
 mod ts;
 
 use attribution::{Attribution, CampaignTable, CampaignTotals, Click, GroupedClicks};
@@ -664,6 +666,10 @@ struct UserRows<N> {
 
 trait OutputName: Copy + Default + Send {
     fn string_array(names: Vec<Self>) -> StringArray;
+
+    fn write_plain(_: &Path, _: &UserRows<Self>) -> bool {
+        false
+    }
 }
 
 impl OutputName for &'static str {
@@ -750,6 +756,52 @@ fn group_facts<F: Fact>(counts: Vec<usize>, named_events: Vec<(usize, F)>) -> (V
     (events, offsets)
 }
 
+struct UserDayWriter<'a, N> {
+    name: N,
+    rows: &'a mut UserRows<N>,
+    categories: &'a [&'static str],
+    day: UserDay,
+    totals: &'a mut [i64],
+    touched: &'a mut Vec<usize>,
+}
+
+impl<N: OutputName> UserDayWriter<'_, N> {
+    #[inline]
+    fn start_session(&mut self, start: i64, events: i64) -> i32 {
+        let day = ts::day_of(start);
+        if self.day.sessions != 0 && self.day.day != day {
+            self.flush();
+            self.day = UserDay::default();
+        }
+        self.day.day = day;
+        self.day.sessions += 1;
+        self.day.events += events;
+        day
+    }
+
+    #[inline]
+    fn purchase(&mut self, category: u32, amount: i64) {
+        let total = &mut self.totals[category as usize];
+        if *total == 0 {
+            self.touched.push(category as usize);
+        }
+        *total += amount;
+        if *total > self.day.best_category_revenue
+            || (*total == self.day.best_category_revenue && Some(category) < self.day.category)
+        {
+            self.day.best_category_revenue = *total;
+            self.day.category = Some(category);
+        }
+    }
+
+    fn flush(&mut self) {
+        self.rows.push(self.name, &self.day, self.categories);
+        for index in self.touched.drain(..) {
+            self.totals[index] = 0;
+        }
+    }
+}
+
 fn summarize<F: Fact, N: OutputName>(
     mut events: Vec<F>,
     offsets: Vec<usize>,
@@ -765,64 +817,77 @@ fn summarize<F: Fact, N: OutputName>(
     let mut attribution = Attribution::new(campaign_count);
     let mut category_totals = vec![0; categories.len()];
     let mut touched = Vec::new();
+    let mut session_bins = None;
     let mut event_pos = 0;
     for (user, (end, name)) in offsets.into_iter().zip(names).enumerate() {
         let user_events = &mut events[event_pos..end];
         event_pos = end;
+        let user_clicks = clicks.for_user(user as u32);
+        attribution.reset();
+        let mut output = UserDayWriter {
+            name,
+            rows: &mut rows,
+            categories,
+            day: UserDay::default(),
+            totals: &mut category_totals,
+            touched: &mut touched,
+        };
+
+        // Bins avoid sorting large groups. Keep the small-user sort and the
+        // same session output path for windows that need too many bins.
+        if user_events.len() >= 2_048 {
+            let workspace = session_bins.get_or_insert_with(|| {
+                time_bins::SessionBins::new(window.start, window.end, categories.len())
+            });
+            if let Some(bins) = workspace {
+                bins.summarize(
+                    user_events,
+                    |event| event.time(window),
+                    F::purchase,
+                    |session, amounts| {
+                        let day = output.start_session(session.start, session.events);
+                        for (category, &amount) in amounts.iter().enumerate() {
+                            if amount != 0 {
+                                output.purchase(category as u32, amount);
+                            }
+                        }
+                        output.day.revenue += session.revenue;
+                        attribution.record(
+                            user_clicks,
+                            session.start,
+                            day,
+                            session.revenue,
+                            &mut campaign_totals,
+                        );
+                    },
+                );
+                output.flush();
+                continue;
+            }
+        }
+
         if user_events.len() >= 32_768 {
             user_events.par_sort_unstable_by_key(|e| e.order());
         } else {
             user_events.sort_unstable_by_key(|e| e.order());
         }
-        let user_clicks = clicks.for_user(user as u32);
-        attribution.reset();
-        let mut day = UserDay::default();
         let sessions = user_events.chunk_by(|a, b| b.order() - a.order() <= SESSION_GAP_MS);
         for session in sessions {
             let start = session[0].time(window);
-            let session_day = ts::day_of(start);
-            if day.sessions != 0 && day.day != session_day {
-                rows.push(name, &day, categories);
-                day = UserDay::default();
-                for index in touched.drain(..) {
-                    category_totals[index] = 0;
-                }
-            }
-            day.day = session_day;
-            day.sessions += 1;
-            day.events += session.len() as i64;
+            let day = output.start_session(start, session.len() as i64);
             let mut revenue = 0;
             for event in session {
                 let (price, category) = event.purchase();
                 if price != 0 {
                     let price = i64::from(price);
                     revenue += price;
-                    let total = &mut category_totals[category as usize];
-                    if *total == 0 {
-                        touched.push(category as usize);
-                    }
-                    *total += price;
-                    if *total > day.best_category_revenue
-                        || (*total == day.best_category_revenue && Some(category) < day.category)
-                    {
-                        day.best_category_revenue = *total;
-                        day.category = Some(category);
-                    }
+                    output.purchase(category, price);
                 }
             }
-            day.revenue += revenue;
-            attribution.record(
-                user_clicks,
-                start,
-                session_day,
-                revenue,
-                &mut campaign_totals,
-            );
+            output.day.revenue += revenue;
+            attribution.record(user_clicks, start, day, revenue, &mut campaign_totals);
         }
-        rows.push(name, &day, categories);
-        for index in touched.drain(..) {
-            category_totals[index] = 0;
-        }
+        output.flush();
     }
     (rows, campaign_totals)
 }
@@ -839,6 +904,9 @@ fn user_schema() -> Arc<Schema> {
 }
 
 fn write_user_rows<N: OutputName>(path: &Path, rows: UserRows<N>, schema: Arc<Schema>) {
+    if N::write_plain(path, &rows) {
+        return;
+    }
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![

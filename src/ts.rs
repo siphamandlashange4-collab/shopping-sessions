@@ -60,11 +60,18 @@ fn two_digits(word: u64) -> u32 {
 }
 
 #[inline]
+fn decimal_pairs(word: u64) -> u64 {
+    let digits = word & 0x0f0f_0f0f_0f0f_0f0f;
+    // Each byte holds ten times its nibble plus its neighbor's nibble.
+    // Even a nondigit separator's nibble cannot carry into the next byte.
+    digits.wrapping_mul(10) + (digits >> 8)
+}
+
+#[inline]
 fn eight_digits(word: u64) -> i64 {
     // Pair neighboring digits at each step. Every lane is wide enough to
     // contain the pairs, groups of four, or final group of eight without carry.
-    let digits = word & 0x0f0f_0f0f_0f0f_0f0f;
-    let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let pairs = decimal_pairs(word) & 0x00ff_00ff_00ff_00ff;
     let quads = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
     (quads.wrapping_mul(10_000).wrapping_add(quads >> 32) as u32) as i64
 }
@@ -149,11 +156,13 @@ fn parse_calendar(s: &[u8]) -> Option<i64> {
         return None;
     }
 
-    let year = (two_digits(ym) * 100 + two_digits(ym >> 16)) as usize;
-    let month = two_digits(ym >> 40) as usize;
-    let day = two_digits(dhm).wrapping_sub(1);
-    let hour = two_digits(dhm >> 24);
-    let min = two_digits(dhm >> 48);
+    let ym = decimal_pairs(ym);
+    let dhm = decimal_pairs(dhm);
+    let year = ym as u8 as usize * 100 + (ym >> 16) as u8 as usize;
+    let month = (ym >> 40) as u8 as usize;
+    let day = (dhm as u8 as u32).wrapping_sub(1);
+    let hour = (dhm >> 24) as u8 as u32;
+    let min = (dhm >> 48) as u8 as u32;
     let sec = ((s[17] - b'0') as u32) * 10 + (s[18] - b'0') as u32;
 
     let &month_info = MONTH_INFO[year].get(month)?;

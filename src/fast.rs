@@ -48,6 +48,11 @@ impl PackedName {
     fn parse(id: &[u8]) -> Option<Self> {
         pack::<b'u'>(id).map(Self)
     }
+
+    fn text_len(self) -> usize {
+        let suffix = self.0 & !UPPER_CASE;
+        1 + ((64 - suffix.leading_zeros()) as usize).div_ceil(8)
+    }
 }
 
 impl OutputName for PackedName {
@@ -63,6 +68,27 @@ impl OutputName for PackedName {
             builder.append_value(std::str::from_utf8(&text[..=len]).expect("UTF-8 user ID"));
         }
         builder.finish()
+    }
+
+    fn write_plain(path: &Path, rows: &UserRows<Self>) -> bool {
+        // This bounds the size of a plain page independently of the number
+        // of repeated category values. The general writer handles longer text.
+        if rows.category.iter().flatten().any(|text| text.len() > 4096) {
+            return false;
+        }
+        let mut table = crate::plain_parquet::UserTable::new(rows.names.len());
+        table.names(&rows.names, Self::text_len, |name, bytes| {
+            let suffix = (name.0 & !UPPER_CASE).to_le_bytes();
+            bytes.push(if name.0 & UPPER_CASE == 0 { b'u' } else { b'U' });
+            bytes.extend_from_slice(&suffix[..name.text_len() - 1]);
+        });
+        table.day(&rows.day);
+        table.integer("sessions", &rows.sessions);
+        table.integer("events", &rows.events);
+        table.integer("revenue_cents", &rows.revenue);
+        table.categories(&rows.category);
+        table.finish(path);
+        true
     }
 }
 
