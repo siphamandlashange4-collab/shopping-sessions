@@ -3,7 +3,7 @@
 
 use super::{
     attribution::{CampaignTable, Click}, Lookup,
-    chunks, csv, event_fact, exchange, find_root, group_facts, shard, summarize, ts, write_results,
+    chunks, csv, event_fact, exchange, find_root, shard, summarize, ts, write_results,
     Buckets, Catalogs, CompactFact, Fact, OutputName, UserRows, Window, BAD_TS, ORGANIC,
     SEVEN_DAYS_MS, SHARDS,
 };
@@ -319,6 +319,7 @@ fn route_partition(
     for piece in &pieces {
         for (index, candidate) in piece.iter().enumerate() {
             if let Some(ahead) = piece.get(index + AHEAD) {
+                prefetch_write(&repeated[ahead.slot(mask) / 64]);
                 if ahead.event.fact.valid() {
                     links.prefetch(ahead.event.person);
                 }
@@ -540,40 +541,169 @@ fn collect_clicks(
     Some(exchange(pieces))
 }
 
+/// Dense IDs for one shard's people, in a flat open-addressed table whose
+/// slot for a name can be prefetched before it is needed. Key 0 marks an
+/// empty slot; a routed person's packed name is never 0.
+struct NameIds {
+    slots: Vec<[u64; 2]>,
+    shift: u32,
+    len: usize,
+}
+
+impl NameIds {
+    fn with_capacity(names: usize) -> Self {
+        let cap = (names * 2 + 16).next_power_of_two();
+        Self {
+            slots: vec![[0, 0]; cap],
+            shift: 64 - cap.trailing_zeros(),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn home(&self, key: u64) -> usize {
+        (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift) as usize
+    }
+
+    #[inline]
+    fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(self.slots.as_ptr().add(self.home(key)).cast::<i8>(), _MM_HINT_T0);
+        }
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let mut bigger = Self::with_capacity(self.slots.len());
+        let mask = bigger.slots.len() - 1;
+        for &[key, value] in &self.slots {
+            if key != 0 {
+                let mut i = bigger.home(key);
+                while bigger.slots[i][0] != 0 {
+                    i = (i + 1) & mask;
+                }
+                bigger.slots[i] = [key, value];
+                bigger.len += 1;
+            }
+        }
+        *self = bigger;
+    }
+
+    /// The ID for `key`, assigning the next one when it is new.
+    #[inline]
+    fn id(&mut self, key: u64, mut make: impl FnMut() -> u64) -> u64 {
+        if (self.len + 1) * 4 > self.slots.len() * 3 {
+            self.grow();
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = self.home(key);
+        loop {
+            let slot = &mut self.slots[i];
+            if slot[0] == key {
+                return slot[1];
+            }
+            if slot[0] == 0 {
+                let id = make();
+                *slot = [key, id];
+                self.len += 1;
+                return id;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: u64) -> Option<u64> {
+        let mask = self.slots.len() - 1;
+        let mut i = self.home(key);
+        loop {
+            let [k, v] = self.slots[i];
+            if k == key {
+                return Some(v);
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
+#[inline]
+fn prefetch_write<T>(slot: &T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch((slot as *const T).cast::<i8>(), _MM_HINT_T0);
+    }
+}
+
 fn aggregate_small(
     parts: Vec<Vec<SmallEvent>>,
     clicks: Vec<Vec<SmallClick>>,
     window: &Window,
     catalogs: &Catalogs,
 ) -> (UserRows<PackedName>, CampaignTable) {
+    const AHEAD: usize = 16;
     let len: usize = parts.iter().map(Vec::len).sum();
-    let mut ids = FxHashMap::with_capacity_and_hasher(len / 12, Default::default());
-    let mut names = Vec::new();
-    let mut counts = Vec::new();
+    let mut ids = NameIds::with_capacity(len / 12);
+    let mut names: Vec<PackedName> = Vec::with_capacity(len / 12);
+    let mut counts: Vec<usize> = Vec::with_capacity(len / 12);
     // Once names are interned, reuse the source buffers to hold dense IDs
-    // until the facts are scattered into their per-person ranges.
+    // until the facts are scattered into their per-person ranges. Both
+    // passes prefetch what the event sixteen rows ahead will touch.
     let mut parts = parts;
-    for event in parts.iter_mut().flatten() {
-        let id = *ids.entry(event.person).or_insert_with(|| {
-            let id = names.len();
-            names.push(event.person);
-            counts.push(0);
-            id
-        });
-        counts[id] += 1;
-        event.person = PackedName(id as u64);
+    for piece in parts.iter_mut() {
+        for index in 0..piece.len() {
+            if let Some(ahead) = piece.get(index + AHEAD) {
+                ids.prefetch(ahead.person.0);
+            }
+            let event = &mut piece[index];
+            let person = event.person;
+            let id = ids.id(person.0, || {
+                let id = names.len() as u64;
+                names.push(person);
+                counts.push(0);
+                id
+            }) as usize;
+            counts[id] += 1;
+            event.person = PackedName(id as u64);
+        }
     }
-    let facts = parts
-        .into_iter()
-        .flatten()
-        .map(|event| (event.person.0 as usize, event.fact));
-    let (events, offsets) = group_facts(counts, len, facts);
+
+    // Scatter each person's facts into one consecutive range; afterwards
+    // offsets[i] is the end of person i's range.
+    let mut end = 0;
+    let mut offsets: Vec<usize> = counts
+        .iter()
+        .map(|&count| {
+            let start = end;
+            end += count;
+            start
+        })
+        .collect();
+    let mut events = vec![CompactFact::default(); len];
+    for piece in parts.iter() {
+        for index in 0..piece.len() {
+            if let Some(ahead) = piece.get(index + AHEAD) {
+                prefetch_write(&events[offsets[ahead.person.0 as usize].min(len - 1)]);
+            }
+            let event = piece[index];
+            let person = event.person.0 as usize;
+            events[offsets[person]] = event.fact;
+            offsets[person] += 1;
+        }
+    }
+    drop(parts);
+
     let clicks = clicks
         .into_iter()
         .flatten()
         .filter_map(|click| {
             Some(Click {
-                user: *ids.get(&click.person)? as u32,
+                user: ids.get(click.person.0)? as u32,
                 time: window.start + i64::from(click.offset_ms),
                 campaign: click.campaign,
                 id: click.id,
