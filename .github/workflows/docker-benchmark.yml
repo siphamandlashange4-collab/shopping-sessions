@@ -1,4 +1,4 @@
-name: Shopping Sessions Docker follow-up benchmark
+name: Shopping Sessions vector CSV Docker benchmark
 on:
   create:
   push:
@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: shopping-sessions-docker-bench-followup
+  group: shopping-sessions-vector-csv-bench
   cancel-in-progress: true
 jobs:
   benchmark:
@@ -22,12 +22,13 @@ jobs:
           cd ci
           git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
           git -C src worktree add --detach "$PWD/baseline" aae66c1975274fe8014875dea69f35bbc4ee5786
-          git -C src worktree add --detach "$PWD/candidate" d30ef9bae1ec9b0581b36f853104f293518d7514
+          git -C src worktree add --detach "$PWD/candidate" b821967459d38bed931dcebbf560ac5b9be88680
           docker build --platform linux/amd64 -t shopping-sessions:baseline baseline
           docker build --platform linux/amd64 -t shopping-sessions:candidate candidate
           docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' shopping-sessions:baseline shopping-sessions:candidate
           nproc
           lscpu | sed -n '/Model name/p'
+          if grep -qm1 avx512bw /proc/cpuinfo; then echo 'AVX-512BW available'; else echo 'AVX-512BW unavailable'; fi
           free -h
           df -h .
       - name: Generate official dev and synthetic practice-scale inputs
@@ -55,6 +56,7 @@ jobs:
           export CPUS=4 MEM=12g PLATFORM=linux/amd64
           comparer=(.venv/bin/python starter-polars/scripts/compare.py)
           runner=starter-polars/scripts/docker_run.sh
+          IMAGE=shopping-sessions:candidate .venv/bin/python starter-polars/scripts/run_fixtures.py starter-polars/fixtures -- sh "$runner"
           for version in baseline candidate; do
             IMAGE="shopping-sessions:$version" sh "$runner" dev "out-dev-$version"
             "${comparer[@]}" "out-dev-$version" dev-answer
