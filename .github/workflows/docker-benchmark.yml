@@ -1,4 +1,4 @@
-name: Shopping Sessions profile-guided Docker benchmark
+name: Shopping Sessions unique UTC day Docker benchmark
 on:
   create:
   push:
@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: shopping-sessions-pgo-bench
+  group: shopping-sessions-unique-utc-bench
   cancel-in-progress: true
 jobs:
   benchmark:
@@ -22,7 +22,7 @@ jobs:
           cd ci
           git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
           git -C src worktree add --detach "$PWD/baseline" aae66c1975274fe8014875dea69f35bbc4ee5786
-          git -C src worktree add --detach "$PWD/candidate" fdf2bd1b611b82287e13ea6fb812867944db6ce6
+          git -C src worktree add --detach "$PWD/candidate" 88f5b78425d93ee2bf4a8daff365f3ff7efcbd73
           docker build --platform linux/amd64 -t shopping-sessions:baseline baseline
           docker build --platform linux/amd64 -t shopping-sessions:candidate candidate
           docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' shopping-sessions:baseline shopping-sessions:candidate
@@ -49,7 +49,8 @@ jobs:
           generator/target/release/generate --seed 41 --events 20000000 --clicks 5000000 --output practice
           python3 -m venv .venv
           .venv/bin/pip install -q -r starter-polars/requirements.txt
-      - name: Verify dev output and time interleaved practice runs
+
+      - name: Compare exact output and time both scales
         shell: bash
         run: |
           cd ci
@@ -61,44 +62,43 @@ jobs:
             IMAGE="shopping-sessions:$version" sh "$runner" dev "out-dev-$version"
             "${comparer[@]}" "out-dev-$version" dev-answer
           done
-          for version in baseline candidate; do
-            IMAGE="shopping-sessions:$version" sh "$runner" practice "out-practice-$version"
-          done
-          "${comparer[@]}" out-practice-baseline out-practice-candidate
-          mkdir timed-output
-          for cycle in {1..6}; do
-            if (( cycle % 2 )); then
-              order=(baseline candidate)
-            else
-              order=(candidate baseline)
-            fi
-            for version in "${order[@]}"; do
-              export IMAGE="shopping-sessions:$version"
-              /usr/bin/time -f "$version %e" -a -o timings.txt sh "$runner" practice timed-output
+          mkdir -m 777 timed-out timed-scratch
+          benchmark() {
+            local input="$1" cycles="$2"
+            for version in baseline candidate; do
+              IMAGE="shopping-sessions:$version" sh "$runner" "$input" "out-$input-$version"
             done
-          done
+            "${comparer[@]}" "out-$input-baseline" "out-$input-candidate"
+            for ((cycle=1; cycle<=cycles; cycle++)); do
+              if (( cycle % 2 )); then
+                order=(baseline candidate)
+              else
+                order=(candidate baseline)
+              fi
+              for version in "${order[@]}"; do
+                /usr/bin/time -f "$input $version %e" -a -o timings.txt docker run --rm --platform linux/amd64 \
+                  --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
+                  --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 \
+                  --cpus "$CPUS" --memory "$MEM" --memory-swap "$MEM" --user 1000:1000 \
+                  -v "$PWD/$input":/data:ro -v "$PWD/timed-out":/output -v "$PWD/timed-scratch":/scratch \
+                  -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+                  -e NCPU="$CPUS" -e MEM_GB=12 "shopping-sessions:$version"
+              done
+            done
+          }
+          benchmark practice 6
+          generator/target/release/generate --seed 77 --events 60000000 --clicks 15000000 --output final-data
+          benchmark final-data 4
           cat timings.txt
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           from collections import defaultdict
           from statistics import median
           times = defaultdict(list)
           for line in open("timings.txt"):
-              name, seconds = line.split()
-              times[name].append(float(seconds))
-          print("Docker medians on the same ubuntu-24.04 runner, 4 vCPUs and 12 GB, 20M generated events")
-          for name, values in times.items():
-              print(f"- {name}: {median(values):.3f}s median ({len(values)} runs)")
-          print(f"- Runtime reduction: {1 - median(times['candidate']) / median(times['baseline']):.1%}")
+              dataset, name, seconds = line.split()
+              times[dataset, name].append(float(seconds))
+          for dataset in ("practice", "final-data"):
+              baseline = median(times[dataset, "baseline"])
+              candidate = median(times[dataset, "candidate"])
+              print(f"{dataset}: baseline {baseline:.3f}s, candidate {candidate:.3f}s, reduction {1-candidate/baseline:.1%}")
           PY
-
-      - name: Check final-scale output equality
-        shell: bash
-        run: |
-          cd ci
-          generator/target/release/generate --seed 77 --events 60000000 --clicks 15000000 --output final-data
-          export CPUS=4 MEM=12g PLATFORM=linux/amd64
-          runner=starter-polars/scripts/docker_run.sh
-          for version in baseline candidate; do
-            IMAGE="shopping-sessions:$version" sh "$runner" final-data "out-final-$version"
-          done
-          .venv/bin/python starter-polars/scripts/compare.py out-final-baseline out-final-candidate
