@@ -3,7 +3,8 @@ FROM rust:1-slim-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked && strip target/release/pipeline
+ARG PIPELINE_CPU=x86-64-v3
+RUN cargo rustc --release --locked -- -C "target-cpu=${PIPELINE_CPU}" && strip target/release/pipeline
 
 # Runtime stage: just the binary.
 FROM debian:bookworm-slim
