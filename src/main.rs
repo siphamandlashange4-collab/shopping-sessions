@@ -7,7 +7,7 @@ mod attribution;
 mod csv;
 mod ts;
 
-use attribution::{Attribution, CampaignTotals, Click};
+use attribution::{Attribution, CampaignTable, CampaignTotals, Click};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::fs;
@@ -73,35 +73,57 @@ fn find(h: &[u8], n: &[u8]) -> Option<usize> {
 // ---------------------------------------------------------------- interner
 
 /// Interns byte strings to dense u32 ids.
-struct Interner {
+struct Interner<const PREFIX: u8> {
+    packed: FxHashMap<u64, u32>,
     map: FxHashMap<&'static [u8], u32>,
     vals: Vec<&'static [u8]>,
 }
 
-impl Interner {
+type UserInterner = Interner<b'u'>;
+type CampaignInterner = Interner<0>;
+
+impl<const PREFIX: u8> Interner<PREFIX> {
     fn new() -> Self {
-        Interner {
-            map: FxHashMap::default(),
-            vals: Vec::new(),
-        }
+        Self::with_capacity(0)
     }
     fn with_capacity(n: usize) -> Self {
         Interner {
-            map: FxHashMap::with_capacity_and_hasher(n, Default::default()),
+            packed: FxHashMap::with_capacity_and_hasher(
+                if PREFIX == 0 { 0 } else { n },
+                Default::default(),
+            ),
+            map: FxHashMap::with_capacity_and_hasher(
+                if PREFIX == 0 { n } else { n.min(64) },
+                Default::default(),
+            ),
             vals: Vec::with_capacity(n),
         }
     }
     #[inline]
     fn intern(&mut self, s: &'static [u8]) -> u32 {
-        *self.map.entry(s).or_insert_with(|| {
+        let packed = pack_id::<PREFIX>(s);
+        let add = || {
             let id = self.vals.len() as u32;
             self.vals.push(s);
             id
-        })
+        };
+        if packed == 0 {
+            *self.map.entry(s).or_insert_with(add)
+        } else {
+            *self.packed.entry(packed).or_insert_with(add)
+        }
     }
     #[inline]
     fn get(&self, s: &[u8]) -> Option<u32> {
-        self.map.get(s).copied()
+        self.get_key(s, pack_id::<PREFIX>(s))
+    }
+    #[inline]
+    fn get_key(&self, s: &[u8], packed: u64) -> Option<u32> {
+        if packed == 0 {
+            self.map.get(s).copied()
+        } else {
+            self.packed.get(&packed).copied()
+        }
     }
     #[inline]
     fn name(&self, id: u32) -> &'static [u8] {
@@ -113,17 +135,15 @@ impl Interner {
 }
 
 #[derive(Clone, Copy)]
-struct Event {
+struct Event<F> {
     user: &'static [u8],
-    time: i64,
-    price: u32,
-    category: u32,
+    fact: F,
 }
 
-struct Candidate<K> {
+struct Candidate<K, F> {
     id: K,
     ingest: i64,
-    event: Event,
+    event: Event<F>,
 }
 
 struct RawClick {
@@ -134,10 +154,108 @@ struct RawClick {
 }
 
 #[derive(Clone, Copy, Default)]
-struct SessionEvent {
+struct WideFact {
     time: i64,
     price: u32,
     category: u32,
+}
+
+trait Fact: Copy + Default + Send + Sync {
+    const INVALID: Self;
+    fn encode(window: &Window, time: i64, price: u32, category: u32) -> Self;
+    fn valid(self) -> bool;
+    fn order(self) -> i64;
+    fn time(self, window: &Window) -> i64;
+    fn purchase(self) -> (u32, u32);
+}
+
+impl Fact for WideFact {
+    const INVALID: Self = Self {
+        time: BAD_TS,
+        price: 0,
+        category: 0,
+    };
+
+    #[inline]
+    fn encode(_: &Window, time: i64, price: u32, category: u32) -> Self {
+        Self {
+            time,
+            price,
+            category,
+        }
+    }
+
+    #[inline]
+    fn valid(self) -> bool {
+        self.time != BAD_TS
+    }
+
+    #[inline]
+    fn order(self) -> i64 {
+        self.time
+    }
+
+    #[inline]
+    fn time(self, _: &Window) -> i64 {
+        self.time
+    }
+
+    #[inline]
+    fn purchase(self) -> (u32, u32) {
+        (self.price, self.category)
+    }
+}
+
+/// Common windows and catalogs fit the event fact in one word. Larger inputs
+/// use WideFact with the same pipeline and no truncation.
+#[derive(Clone, Copy, Default)]
+struct CompactFact(u64);
+
+impl CompactFact {
+    const TIME_BITS: u32 = 31;
+    const CATEGORY_BITS: u32 = 9;
+    const PRICE_BITS: u32 = 24;
+    const TIME_SHIFT: u32 = Self::CATEGORY_BITS + Self::PRICE_BITS;
+
+    fn fits(window: &Window, categories: usize) -> bool {
+        window.end.saturating_sub(window.start) <= 1 << Self::TIME_BITS
+            && categories <= 1 << Self::CATEGORY_BITS
+    }
+}
+
+impl Fact for CompactFact {
+    const INVALID: Self = Self(u64::MAX);
+
+    #[inline]
+    fn encode(window: &Window, time: i64, price: u32, category: u32) -> Self {
+        Self(
+            ((time - window.start) as u64) << Self::TIME_SHIFT
+                | (u64::from(category) << Self::PRICE_BITS)
+                | u64::from(price),
+        )
+    }
+
+    #[inline]
+    fn valid(self) -> bool {
+        self.0 != Self::INVALID.0
+    }
+
+    #[inline]
+    fn order(self) -> i64 {
+        (self.0 >> Self::TIME_SHIFT) as i64
+    }
+
+    #[inline]
+    fn time(self, window: &Window) -> i64 {
+        window.start + self.order()
+    }
+
+    #[inline]
+    fn purchase(self) -> (u32, u32) {
+        let price = self.0 & ((1 << Self::PRICE_BITS) - 1);
+        let category = (self.0 >> Self::PRICE_BITS) & ((1 << Self::CATEGORY_BITS) - 1);
+        (price as u32, category as u32)
+    }
 }
 
 struct Window {
@@ -145,9 +263,23 @@ struct Window {
     end: i64,
 }
 
+impl Window {
+    fn campaign_table(&self, campaigns: usize) -> CampaignTable {
+        CampaignTable::new(campaigns, ts::day_of(self.start), ts::day_of(self.end - 1))
+    }
+}
+
+struct Catalogs {
+    products: FxHashMap<&'static [u8], u32>,
+    unknown_category: u32,
+    categories: Vec<&'static str>,
+    campaigns: CampaignInterner,
+    channels: Vec<&'static [u8]>,
+}
+
 struct LinkNames {
-    users: Interner,
-    person: Vec<u32>,
+    users: UserInterner,
+    person: Vec<(&'static [u8], usize)>,
 }
 
 impl LinkNames {
@@ -161,7 +293,7 @@ impl LinkNames {
                 })
             })
             .collect();
-        let mut users = Interner::with_capacity(pairs.len() * 2);
+        let mut users = UserInterner::with_capacity(pairs.len() * 2);
         let mut parent = Vec::new();
         let mut rank = Vec::new();
         for (a, b) in pairs {
@@ -188,16 +320,20 @@ impl LinkNames {
             }
         }
         let person = (0..users.len() as u32)
-            .map(|id| smallest[find_root(&mut parent, id) as usize])
+            .map(|id| {
+                let name = users.name(smallest[find_root(&mut parent, id) as usize]);
+                (name, user_shard(name, pack_id::<b'u'>(name)))
+            })
             .collect();
         Self { users, person }
     }
 
     #[inline]
-    fn name(&self, user: &'static [u8]) -> &'static [u8] {
-        match self.users.get(user) {
-            Some(id) => self.users.name(self.person[id as usize]),
-            None => user,
+    fn route(&self, user: &'static [u8]) -> (&'static [u8], usize) {
+        let key = pack_id::<b'u'>(user);
+        match self.users.get_key(user, key) {
+            Some(id) => self.person[id as usize],
+            None => (user, user_shard(user, key)),
         }
     }
 }
@@ -257,16 +393,27 @@ fn shard(hash: u64) -> usize {
 }
 
 #[inline]
-fn user_shard(user: &[u8]) -> usize {
-    shard(rustc_hash::FxBuildHasher.hash_one(user))
+fn user_shard(user: &[u8], packed: u64) -> usize {
+    let hash = if packed == 0 {
+        rustc_hash::FxBuildHasher.hash_one(user)
+    } else {
+        rustc_hash::FxBuildHasher.hash_one(packed)
+    };
+    shard(hash)
 }
 
-/// Short event IDs beginning with e fit losslessly in a machine word. A
+/// Short IDs beginning with the selected prefix fit losslessly in a word. A
 /// nonzero last byte distinguishes the length after zero padding. All other
 /// IDs still use their complete bytes as the key.
 #[inline]
-fn pack_event_id(id: &[u8]) -> u64 {
-    if let [b'e', tail @ ..] = id {
+fn pack_id<const PREFIX: u8>(id: &[u8]) -> u64 {
+    if PREFIX == 0 {
+        return 0;
+    }
+    if let [first, tail @ ..] = id {
+        if *first != PREFIX {
+            return 0;
+        }
         if tail.len() == 8 {
             let key = u64::from_le_bytes(tail.try_into().unwrap());
             if key >> 56 != 0 {
@@ -284,18 +431,19 @@ fn pack_event_id(id: &[u8]) -> u64 {
     0
 }
 
-fn user_events(
+fn user_events<F: Fact>(
     buffers: &[&'static [u8]],
     window: &Window,
     links: &LinkNames,
     products: &FxHashMap<&'static [u8], u32>,
     unknown: u32,
-) -> [Vec<Vec<Event>>; SHARDS] {
+) -> [Vec<Vec<Event<F>>>; SHARDS] {
     let (packed_pieces, fallback_pieces) = chunks(buffers)
         .into_par_iter()
         .map(|chunk| {
-            let mut packed_buckets: Buckets<Candidate<u64>> = std::array::from_fn(|_| Vec::new());
-            let mut fallback_buckets: Buckets<Candidate<&[u8]>> =
+            let mut packed_buckets: Buckets<Candidate<u64, F>> =
+                std::array::from_fn(|_| Vec::new());
+            let mut fallback_buckets: Buckets<Candidate<&[u8], F>> =
                 std::array::from_fn(|_| Vec::new());
             for [id, user, time, ingest, kind, product, price] in csv::Rows::<7>::raw(chunk) {
                 if id.is_empty() {
@@ -305,9 +453,7 @@ fn user_events(
                 let time = ts::parse(time).unwrap_or(BAD_TS);
                 let mut event = Event {
                     user,
-                    time: BAD_TS,
-                    price: 0,
-                    category: 0,
+                    fact: F::INVALID,
                 };
                 if !user.is_empty()
                     && !product.is_empty()
@@ -316,20 +462,19 @@ fn user_events(
                     && ingest - time <= LATE_MS
                 {
                     match kind {
-                        b"view" | b"cart" => event.time = time,
+                        b"view" | b"cart" => event.fact = F::encode(window, time, 0, 0),
                         b"purchase" if csv::all_digits(price) => {
                             let amount = csv::parse_u64(price);
                             if (1..=10_000_000).contains(&amount) {
-                                event.time = time;
-                                event.price = amount as u32;
-                                event.category = products.get(product).copied().unwrap_or(unknown);
+                                let category = products.get(product).copied().unwrap_or(unknown);
+                                event.fact = F::encode(window, time, amount as u32, category);
                             }
                         }
                         _ => {}
                     }
                 }
                 // Invalid rows still participate in the earliest-ingest election.
-                let packed = pack_event_id(id);
+                let packed = pack_id::<b'e'>(id);
                 if packed == 0 {
                     let hash = rustc_hash::FxBuildHasher.hash_one(id);
                     fallback_buckets[shard(hash)].push(Candidate { id, ingest, event });
@@ -359,30 +504,53 @@ fn user_events(
     exchange(grouped)
 }
 
-fn route_winners<K: std::hash::Hash + Eq + Copy>(
-    pieces: &[Vec<Candidate<K>>],
+fn route_winners<K: std::hash::Hash + Eq + Copy, F: Fact>(
+    pieces: &[Vec<Candidate<K, F>>],
     links: &LinkNames,
-    buckets: &mut Buckets<Event>,
+    buckets: &mut Buckets<Event<F>>,
 ) {
     use std::collections::hash_map::Entry;
-    let total = pieces.iter().map(Vec::len).sum();
-    let mut winners = FxHashMap::with_capacity_and_hasher(total, Default::default());
-    for candidate in pieces.iter().flatten() {
-        match winners.entry(candidate.id) {
-            Entry::Vacant(entry) => {
-                entry.insert(candidate);
+    let mut total = 0;
+    let offsets: Vec<_> = pieces
+        .iter()
+        .map(|piece| {
+            let offset = total;
+            total += piece.len();
+            offset
+        })
+        .collect();
+    // Access another row only when its ID actually repeats. Keep the large
+    // candidate scan sequential and the hash-table values eight bytes wide.
+    let mut dropped = vec![false; total];
+    let mut winners: FxHashMap<K, (u32, u32)> =
+        FxHashMap::with_capacity_and_hasher(total, Default::default());
+    for (piece, rows) in pieces.iter().enumerate() {
+        for (row, candidate) in rows.iter().enumerate() {
+            let current = (piece as u32, row as u32);
+            match winners.entry(candidate.id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(current);
+                }
+                Entry::Occupied(mut entry) => {
+                    let &(prior_piece, prior_row) = entry.get();
+                    let (a, b) = (prior_piece as usize, prior_row as usize);
+                    if candidate.ingest < pieces[a][b].ingest {
+                        dropped[offsets[a] + b] = true;
+                        entry.insert(current);
+                    } else {
+                        dropped[offsets[piece] + row] = true;
+                    }
+                }
             }
-            Entry::Occupied(mut entry) if candidate.ingest < entry.get().ingest => {
-                entry.insert(candidate);
-            }
-            _ => {}
         }
     }
-    for candidate in winners.into_values() {
+    drop(winners);
+    for (candidate, dropped) in pieces.iter().flatten().zip(dropped) {
         let mut event = candidate.event;
-        if event.time != BAD_TS {
-            event.user = links.name(event.user);
-            buckets[user_shard(event.user)].push(event);
+        if !dropped && event.fact.valid() {
+            let (user, group) = links.route(event.user);
+            event.user = user;
+            buckets[group].push(event);
         }
     }
 }
@@ -391,7 +559,7 @@ fn user_clicks(
     buffers: &[&'static [u8]],
     window: &Window,
     links: &LinkNames,
-    campaigns: &Interner,
+    campaigns: &CampaignInterner,
 ) -> [Vec<Vec<RawClick>>; SHARDS] {
     let click_start = window.start - SEVEN_DAYS_MS;
     let pieces = chunks(buffers)
@@ -411,10 +579,10 @@ fn user_clicks(
                 let Some(campaign) = campaigns.get(campaign).filter(|&id| id != ORGANIC) else {
                     continue;
                 };
-                let user = links.name(user);
+                let (user, group) = links.route(user);
                 // Identical click copies have the same attribution tie-break and
                 // occupy one campaign in the sliding window, even if both are kept.
-                buckets[user_shard(user)].push(RawClick {
+                buckets[group].push(RawClick {
                     user,
                     id,
                     time,
@@ -459,14 +627,15 @@ impl UserRows {
     }
 }
 
-fn aggregate(
-    event_parts: Vec<Vec<Event>>,
+fn aggregate<F: Fact>(
+    event_parts: Vec<Vec<Event<F>>>,
     click_parts: Vec<Vec<RawClick>>,
     categories: &[&'static str],
     campaign_count: usize,
-) -> (UserRows, FxHashMap<(u32, i32), CampaignTotals>) {
+    window: &Window,
+) -> (UserRows, CampaignTable) {
     let num_events = event_parts.iter().map(Vec::len).sum::<usize>();
-    let mut names = Interner::with_capacity(num_events / 12);
+    let mut names = UserInterner::with_capacity(num_events / 12);
     let mut named_events = Vec::with_capacity(num_events);
     let mut counts = Vec::new();
     for event in event_parts.into_iter().flatten() {
@@ -475,14 +644,7 @@ fn aggregate(
             counts.push(0);
         }
         counts[user] += 1;
-        named_events.push((
-            user,
-            SessionEvent {
-                time: event.time,
-                price: event.price,
-                category: event.category,
-            },
-        ));
+        named_events.push((user, event.fact));
     }
     // Group by the dense person ID in linear time, then sort only within people.
     let mut end = 0;
@@ -494,7 +656,7 @@ fn aggregate(
             start
         })
         .collect();
-    let mut events = vec![SessionEvent::default(); num_events];
+    let mut events = vec![F::default(); num_events];
     for (user, event) in named_events {
         events[offsets[user]] = event;
         offsets[user] += 1;
@@ -519,7 +681,7 @@ fn aggregate(
     });
 
     let mut rows = UserRows::default();
-    let mut campaign_totals = FxHashMap::default();
+    let mut campaign_totals = window.campaign_table(campaign_count);
     let mut attribution = Attribution::new(campaign_count);
     let mut category_totals = vec![0; categories.len()];
     let mut touched = Vec::new();
@@ -530,9 +692,9 @@ fn aggregate(
         let user_events = &mut events[event_pos..end];
         event_pos = end;
         if user_events.len() >= 32_768 {
-            user_events.par_sort_unstable_by_key(|e| e.time);
+            user_events.par_sort_unstable_by_key(|e| e.order());
         } else {
-            user_events.sort_unstable_by_key(|e| e.time);
+            user_events.sort_unstable_by_key(|e| e.order());
         }
         let name = std::str::from_utf8(names.name(user)).expect("UTF-8 user ID");
         let first = click_pos;
@@ -542,9 +704,9 @@ fn aggregate(
         let user_clicks = &clicks[first..click_pos];
         attribution.reset();
         let mut day = UserDay::default();
-        let sessions = user_events.chunk_by(|a, b| b.time - a.time <= SESSION_GAP_MS);
+        let sessions = user_events.chunk_by(|a, b| b.order() - a.order() <= SESSION_GAP_MS);
         for session in sessions {
-            let start = session[0].time;
+            let start = session[0].time(window);
             let session_day = ts::day_of(start);
             if day.sessions != 0 && day.day != session_day {
                 rows.push(name, &day, categories);
@@ -558,20 +720,20 @@ fn aggregate(
             day.events += session.len() as i64;
             let mut revenue = 0;
             for event in session {
-                if event.price != 0 {
-                    let price = i64::from(event.price);
+                let (price, category) = event.purchase();
+                if price != 0 {
+                    let price = i64::from(price);
                     revenue += price;
-                    let total = &mut category_totals[event.category as usize];
+                    let total = &mut category_totals[category as usize];
                     if *total == 0 {
-                        touched.push(event.category as usize);
+                        touched.push(category as usize);
                     }
                     *total += price;
                     if *total > day.best_category_revenue
-                        || (*total == day.best_category_revenue
-                            && Some(event.category) < day.category)
+                        || (*total == day.best_category_revenue && Some(category) < day.category)
                     {
                         day.best_category_revenue = *total;
-                        day.category = Some(event.category);
+                        day.category = Some(category);
                     }
                 }
             }
@@ -622,7 +784,7 @@ fn write_user_rows(path: &Path, rows: UserRows, schema: Arc<Schema>) {
 fn write_campaign_rows(
     path: &Path,
     totals: FxHashMap<(u32, i32), CampaignTotals>,
-    campaigns: &Interner,
+    campaigns: &CampaignInterner,
     channels: &[&'static [u8]],
 ) {
     let mut campaign = Vec::with_capacity(totals.len());
@@ -723,7 +885,7 @@ fn main() {
 
     // ---- campaigns.csv -> campaign id -> channel. id 0 is reserved for organic.
     let cbuf = read_file(&data.join("campaigns.csv"));
-    let mut camp = Interner::new();
+    let mut camp = CampaignInterner::new();
     camp.intern(b"organic"); // id 0
     let mut channel_of: Vec<&'static [u8]> = vec![b"organic"];
     for line in csv::Lines::new(cbuf) {
@@ -741,6 +903,24 @@ fn main() {
         start: window_start,
         end: window_end,
     };
+    let catalogs = Catalogs {
+        products: product_cat,
+        unknown_category: unknown_cat,
+        categories: cat_names
+            .into_iter()
+            .map(|name| std::str::from_utf8(name).expect("UTF-8 category"))
+            .collect(),
+        campaigns: camp,
+        channels: channel_of,
+    };
+    if CompactFact::fits(&window, catalogs.categories.len()) {
+        run_pipeline::<CompactFact>(data, outdir, &window, &catalogs);
+    } else {
+        run_pipeline::<WideFact>(data, outdir, &window, &catalogs);
+    }
+}
+
+fn run_pipeline<F: Fact>(data: &Path, outdir: &Path, window: &Window, catalogs: &Catalogs) {
     let (links, (event_bufs, click_bufs)) = rayon::join(
         || LinkNames::build(&read_dir_csvs(&data.join("links"))),
         || {
@@ -751,25 +931,35 @@ fn main() {
         },
     );
     let (events, clicks) = rayon::join(
-        || user_events(&event_bufs, &window, &links, &product_cat, unknown_cat),
-        || user_clicks(&click_bufs, &window, &links, &camp),
+        || {
+            user_events::<F>(
+                &event_bufs,
+                window,
+                &links,
+                &catalogs.products,
+                catalogs.unknown_category,
+            )
+        },
+        || user_clicks(&click_bufs, window, &links, &catalogs.campaigns),
     );
-    let categories: Vec<_> = cat_names
-        .into_iter()
-        .map(|name| std::str::from_utf8(name).expect("UTF-8 category"))
-        .collect();
     let user_dir = outdir.join("user_daily");
     let campaign_dir = outdir.join("campaign_daily");
     fs::create_dir_all(&user_dir).expect("create user_daily");
     fs::create_dir_all(&campaign_dir).expect("create campaign_daily");
 
     let schema = user_schema();
-    let parts: Vec<_> = events
+    let totals = events
         .into_par_iter()
         .zip(clicks)
         .enumerate()
         .map(|(part, (events, clicks))| {
-            let (rows, totals) = aggregate(events, clicks, &categories, channel_of.len());
+            let (rows, totals) = aggregate(
+                events,
+                clicks,
+                &catalogs.categories,
+                catalogs.channels.len(),
+                window,
+            );
             let path = user_dir.join(format!("part-{part}.parquet"));
             if part == 0 || !rows.names.is_empty() {
                 write_user_rows(&path, rows, schema.clone());
@@ -778,16 +968,15 @@ fn main() {
             }
             totals
         })
-        .collect();
-
-    let mut totals: FxHashMap<_, CampaignTotals> = FxHashMap::default();
-    for (key, value) in parts.into_iter().flatten() {
-        *totals.entry(key).or_default() += value;
-    }
+        .reduce_with(|mut totals, partial| {
+            totals.merge(partial);
+            totals
+        })
+        .expect("at least one aggregation shard");
     write_campaign_rows(
         &campaign_dir.join("part-0.parquet"),
-        totals,
-        &camp,
-        &channel_of,
+        totals.into_rows(),
+        &catalogs.campaigns,
+        &catalogs.channels,
     );
 }

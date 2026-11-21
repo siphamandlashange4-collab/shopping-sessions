@@ -16,42 +16,32 @@ const fn is_leap(y: i32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// The first day of each representable year, with the leap flag in bit 0.
-const YEAR_INFO: [i32; 10_000] = {
-    let mut years = [0; 10_000];
+/// Each month packs its first epoch day and length into one entry.
+/// Padding the year to 16 entries leaves invalid months with zero length.
+static MONTH_INFO: [[i32; 16]; 10_000] = {
+    let length = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut years = [[0; 16]; 10_000];
     let mut year = 0;
     let mut first_day = -719_528; // 0000-01-01, in days since 1970-01-01
     while year < years.len() {
         let leap = is_leap(year as i32) as i32;
-        years[year] = (first_day << 1) | leap;
-        first_day += 365 + leap;
+        let mut month = 1;
+        while month <= 12 {
+            let days = length[month] + if month == 2 { leap } else { 0 };
+            years[year][month] = (first_day << 5) | days;
+            first_day += days;
+            month += 1;
+        }
         year += 1;
     }
     years
 };
 
-/// Month number -> (days before that month, number of days in that month).
-const MONTH_INFO: [[(i32, u32); 13]; 2] = {
-    let length = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut months = [[(0, 0); 13]; 2];
-    let mut leap = 0;
-    while leap < 2 {
-        let mut first_day = 0;
-        let mut month = 1;
-        while month <= 12 {
-            let days = length[month] + if month == 2 { leap as u32 } else { 0 };
-            months[leap][month] = (first_day, days);
-            first_day += days as i32;
-            month += 1;
-        }
-        leap += 1;
-    }
-    months
-};
-
 const ASCII_ZERO: u64 = u64::from_le_bytes([b'0'; 8]);
+#[cfg(not(target_arch = "x86_64"))]
 const YM_DIGITS: u64 = u64::from_le_bytes([255, 255, 255, 255, 0, 255, 255, 0]);
 const YM_PUNCT: u64 = u64::from_le_bytes(*b"\0\0\0\0-\0\0-");
+#[cfg(not(target_arch = "x86_64"))]
 const DHM_DIGITS: u64 = u64::from_le_bytes([255, 255, 0, 255, 255, 0, 255, 255]);
 const DHM_PUNCT: u64 = u64::from_le_bytes(*b"\0\0T\0\0:\0\0");
 
@@ -90,7 +80,9 @@ pub fn parse(s: &[u8]) -> Option<i64> {
             if digit_errors(first) | digit_errors(last) != 0 {
                 return None;
             }
-            Some(eight_digits(first) * 100_000 + eight_digits(last) % 100_000)
+            let top = (two_digits(first) * 100 + two_digits(first >> 16)) as u64 * 10
+                + ((first >> 32) & 15);
+            Some(top as i64 * 100_000_000 + eight_digits(last))
         }
         _ => parse_epoch(s),
     }
@@ -115,17 +107,44 @@ fn parse_epoch(s: &[u8]) -> Option<i64> {
 }
 
 #[inline]
+fn calendar_prefix(ym: u64, dhm: u64) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+
+        // The 16-byte prefix is already available as two machine words. SSE2
+        // is part of x86-64. The first mask chooses the 12 decimal positions.
+        const DIGITS: i32 = 0xdb6f;
+        unsafe {
+            let value = _mm_set_epi64x(dhm as i64, ym as i64);
+            let template = _mm_set_epi64x(DHM_PUNCT as i64, YM_PUNCT as i64);
+            let bad_punct = !_mm_movemask_epi8(_mm_cmpeq_epi8(value, template));
+            let digits = _mm_sub_epi8(value, _mm_set1_epi8(b'0' as i8));
+            let bad_digits = !_mm_movemask_epi8(_mm_cmpeq_epi8(
+                _mm_subs_epu8(digits, _mm_set1_epi8(9)),
+                _mm_setzero_si128(),
+            ));
+            ((bad_punct & !DIGITS) | (bad_digits & DIGITS)) & 0xffff == 0
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (ym & !YM_DIGITS) == YM_PUNCT
+            && (dhm & !DHM_DIGITS) == DHM_PUNCT
+            && digit_errors((ym & YM_DIGITS) | (ASCII_ZERO & !YM_DIGITS))
+                | digit_errors((dhm & DHM_DIGITS) | (ASCII_ZERO & !DHM_DIGITS))
+                == 0
+    }
+}
+
+#[inline]
 fn parse_calendar(s: &[u8]) -> Option<i64> {
     let ym = u64::from_le_bytes(s[..8].try_into().unwrap());
     let dhm = u64::from_le_bytes(s[8..16].try_into().unwrap());
-    if (ym & !YM_DIGITS) != YM_PUNCT
-        || (dhm & !DHM_DIGITS) != DHM_PUNCT
-        || s[16] != b':'
+    if s[16] != b':'
         || !s[17].is_ascii_digit()
         || !s[18].is_ascii_digit()
-        || digit_errors((ym & YM_DIGITS) | (ASCII_ZERO & !YM_DIGITS))
-            | digit_errors((dhm & DHM_DIGITS) | (ASCII_ZERO & !DHM_DIGITS))
-            != 0
+        || !calendar_prefix(ym, dhm)
     {
         return None;
     }
@@ -137,13 +156,12 @@ fn parse_calendar(s: &[u8]) -> Option<i64> {
     let min = two_digits(dhm >> 48);
     let sec = ((s[17] - b'0') as u32) * 10 + (s[18] - b'0') as u32;
 
-    let year_info = YEAR_INFO[year];
-    let &(month_start, month_length) = MONTH_INFO[(year_info & 1) as usize].get(month)?;
-    if day >= month_length || hour > 23 || min > 59 || sec > 59 {
+    let &month_info = MONTH_INFO[year].get(month)?;
+    if day >= (month_info as u32 & 31) || hour > 23 || min > 59 || sec > 59 {
         return None;
     }
 
-    let days = (year_info >> 1) + month_start + day as i32;
+    let days = (month_info >> 5) + day as i32;
     let base = days as i64 * 86_400_000 + ((hour * 60 + min) * 60 + sec) as i64 * 1000;
     if s.len() == 20 {
         return (s[19] == b'Z').then_some(base);

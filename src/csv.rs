@@ -55,8 +55,10 @@ pub struct Rows<'a, const N: usize> {
     field_start: usize,
     block_start: usize,
     block_end: usize,
-    delimiters: u32,
-    quotes: u32,
+    delimiters: u64,
+    quotes: u64,
+    #[cfg(target_arch = "x86_64")]
+    avx2: bool,
 }
 
 impl<'a, const N: usize> Rows<'a, N> {
@@ -69,6 +71,8 @@ impl<'a, const N: usize> Rows<'a, N> {
             block_end: 0,
             delimiters: 0,
             quotes: 0,
+            #[cfg(target_arch = "x86_64")]
+            avx2: std::arch::is_x86_feature_detected!("avx2"),
         }
     }
 
@@ -87,24 +91,65 @@ impl<'a, const N: usize> Rows<'a, N> {
             }
             self.block_start = self.block_end;
             let block = &self.buf[self.block_start..];
-            (self.delimiters, self.quotes) = scan_block(block);
+            #[cfg(target_arch = "x86_64")]
+            if self.avx2 && block.len() >= 64 {
+                // `avx2` was checked at construction. The length check makes
+                // both unaligned 32-byte reads stay within the input slice.
+                (self.delimiters, self.quotes) = unsafe { scan_avx2(block.as_ptr()) };
+                self.block_end += 64;
+                continue;
+            }
+            let (delimiters, quotes) = scan_block(block);
+            self.delimiters = delimiters as u64;
+            self.quotes = quotes as u64;
             self.block_end += block.len().min(32);
         }
 
         let bit = self.delimiters.trailing_zeros();
-        let preceding = (1u32 << bit) - 1;
+        let preceding = (1u64 << bit) - 1;
         self.delimiters &= self.delimiters - 1;
-        has_quote |= self.quotes & preceding != 0;
+        let quotes = self.quotes & preceding;
         self.quotes &= !preceding;
 
         let end = self.block_start + bit as usize;
-        let field = &self.buf[self.field_start..end];
+        // The delimiter came from a bounded scan of the input, and field_start
+        // is immediately after its previous delimiter (or 0 for the first).
+        let field = unsafe { self.buf.get_unchecked(self.field_start..end) };
+        let value = if has_quote {
+            strip_quotes(field)
+        } else if quotes == 0 {
+            Some(field)
+        } else if field.len() < 2 {
+            None
+        } else if self.field_start < self.block_start {
+            strip_quotes(field)
+        } else {
+            let first = self.field_start - self.block_start;
+            let last = bit - 1;
+            (quotes == (1 << first | 1 << last)).then(|| &field[1..field.len() - 1])
+        };
         self.field_start = end + 1;
-        (
-            if has_quote { strip_quotes(field) } else { Some(field) },
-            self.buf[end] == b'\n',
-        )
+        (value, unsafe { *self.buf.get_unchecked(end) } == b'\n')
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_avx2(ptr: *const u8) -> (u64, u64) {
+    use std::arch::x86_64::*;
+
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let newline = _mm256_set1_epi8(b'\n' as i8);
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let a = _mm256_loadu_si256(ptr.cast());
+    let b = _mm256_loadu_si256(ptr.add(32).cast());
+    let a_delim = _mm256_or_si256(_mm256_cmpeq_epi8(a, comma), _mm256_cmpeq_epi8(a, newline));
+    let b_delim = _mm256_or_si256(_mm256_cmpeq_epi8(b, comma), _mm256_cmpeq_epi8(b, newline));
+    let delimiters = (_mm256_movemask_epi8(a_delim) as u32 as u64)
+        | ((_mm256_movemask_epi8(b_delim) as u32 as u64) << 32);
+    let quotes = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)) as u32 as u64)
+        | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)) as u32 as u64) << 32);
+    (delimiters, quotes)
 }
 
 impl<'a, const N: usize> Iterator for Rows<'a, N> {
@@ -243,6 +288,12 @@ mod tests {
             let expected: Vec<_> = Lines::raw(input.as_bytes()).filter_map(split_n::<3>).collect();
             let actual: Vec<_> = Rows::<3>::raw(input.as_bytes()).collect();
             assert_eq!(actual, expected, "padding {padding}");
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut portable = Rows::<3>::raw(input.as_bytes());
+                portable.avx2 = false;
+                assert!(portable.eq(expected));
+            }
         }
     }
 }
