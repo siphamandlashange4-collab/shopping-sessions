@@ -182,9 +182,55 @@ fn parse_calendar(s: &[u8]) -> Option<i64> {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct IngestDate {
+    year_month: u64,
+    day: u16,
+    midnight_ms: i64,
+}
+
+/// An exact date cache local to each parser lane. Evictions affect only
+/// runtime, since a miss recomputes the day using the full calendar.
+#[derive(Default)]
+pub struct IngestDates {
+    entries: [IngestDate; 32],
+}
+
+impl IngestDates {
+    #[inline]
+    pub fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        let Ok(s) = <&[u8; 20]>::try_from(s) else {
+            return parse(s);
+        };
+        let year_month = u64::from_le_bytes(s[..8].try_into().unwrap());
+        let day = u16::from_le_bytes([s[8], s[9]]);
+        let entry = &mut self.entries[two_digits(u64::from(day)) as usize & 31];
+        if entry.year_month != year_month || entry.day != day || year_month == 0 {
+            return Self::refresh(entry, s, year_month, day);
+        }
+
+        let pairs = decimal_pairs(u64::from_le_bytes(s[11..19].try_into().unwrap()));
+        let hour = pairs as u8 as u32;
+        let min = (pairs >> 24) as u8 as u32;
+        let sec = (pairs >> 48) as u8 as u32;
+        if hour > 23 || min > 59 || sec > 59 {
+            return None;
+        }
+        Some(entry.midnight_ms + ((hour * 60 + min) * 60 + sec) as i64 * 1000)
+    }
+
+    #[cold]
+    fn refresh(entry: &mut IngestDate, s: &[u8], year_month: u64, day: u16) -> Option<i64> {
+        let ms = parse_ingest(s)?;
+        let midnight_ms = ms.div_euclid(86_400_000) * 86_400_000;
+        *entry = IngestDate { year_month, day, midnight_ms };
+        Some(ms)
+    }
+}
+
 /// Ingest timestamps are guaranteed to be valid UTC whole seconds.
 #[inline]
-pub fn parse_ingest(s: &[u8]) -> Option<i64> {
+fn parse_ingest(s: &[u8]) -> Option<i64> {
     let Ok(s) = <&[u8; 20]>::try_from(s) else {
         return parse(s);
     };
@@ -222,6 +268,20 @@ pub fn day_of(ms: i64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingest_cache_handles_hits_and_same_day_in_other_months() {
+        let mut dates = IngestDates::default();
+        for timestamp in [
+            &b"1969-12-01T00:01:02Z"[..],
+            &b"1969-12-01T23:59:58Z"[..],
+            &b"2028-02-01T12:37:41Z"[..],
+            &b"2028-02-01T00:24:19Z"[..],
+            &b"1969-12-01T07:03:00Z"[..],
+        ] {
+            assert_eq!(dates.parse(timestamp), parse(timestamp));
+        }
+    }
 
     #[test]
     fn forms_agree() {

@@ -240,6 +240,7 @@ fn collect_events(
         .map(|chunks| {
             let mut people: Buckets<SmallEvent> = std::array::from_fn(|_| Vec::new());
             let mut possible: Buckets<Candidate> = std::array::from_fn(|_| Vec::new());
+            let mut ingest_dates = ts::IngestDates::default();
             for chunk in chunks {
                 if !csv::for_each::<7>(chunk, |[id, person, time, ingest, kind, product, price]| {
                     if id.is_empty() {
@@ -248,7 +249,7 @@ fn collect_events(
                     let Some(id) = pack::<b'e'>(id) else {
                         return false;
                     };
-                    let ingest = ts::parse_ingest(ingest).unwrap_or(BAD_TS);
+                    let ingest = ingest_dates.parse(ingest).unwrap_or(BAD_TS);
                     let fact = event_fact::<CompactFact>(
                         window,
                         &catalogs.products,
