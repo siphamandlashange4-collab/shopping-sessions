@@ -20,7 +20,7 @@ use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 const DAY_MS: i64 = 86_400_000;
 const SESSION_GAP_MS: i64 = 1_800_000; // 30 minutes
@@ -703,7 +703,7 @@ fn aggregate<F: Fact>(
         counts[user] += 1;
         named_events.push((user, event.fact));
     }
-    let (events, offsets) = group_facts(counts, named_events);
+    let (events, offsets) = group_facts(counts, num_events, named_events);
     let clicks: Vec<_> = click_parts
         .into_iter()
         .flatten()
@@ -732,7 +732,11 @@ fn aggregate<F: Fact>(
 }
 
 // Group by the dense person ID in linear time, then sort only within people.
-fn group_facts<F: Fact>(counts: Vec<usize>, named_events: Vec<(usize, F)>) -> (Vec<F>, Vec<usize>) {
+fn group_facts<F: Fact>(
+    counts: Vec<usize>,
+    num_events: usize,
+    named_events: impl IntoIterator<Item = (usize, F)>,
+) -> (Vec<F>, Vec<usize>) {
     let mut end = 0;
     let mut offsets: Vec<_> = counts
         .into_iter()
@@ -742,7 +746,7 @@ fn group_facts<F: Fact>(counts: Vec<usize>, named_events: Vec<(usize, F)>) -> (V
             start
         })
         .collect();
-    let mut events = vec![F::default(); named_events.len()];
+    let mut events = vec![F::default(); num_events];
     for (user, event) in named_events {
         events[offsets[user]] = event;
         offsets[user] += 1;
@@ -904,6 +908,7 @@ fn write_batch(path: &Path, batch: RecordBatch) {
     let props = WriterProperties::builder()
         .set_compression(Compression::UNCOMPRESSED)
         .set_dictionary_enabled(false)
+        .set_statistics_enabled(EnabledStatistics::None)
         .set_encoding(Encoding::PLAIN)
         .build();
     let file = fs::File::create(path).expect("create parquet file");

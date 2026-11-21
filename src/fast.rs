@@ -88,7 +88,7 @@ impl PackedLinks {
 
 #[derive(Clone, Copy)]
 struct SmallEvent {
-    person: PackedName,
+    person_key: u64,
     fact: CompactFact,
 }
 
@@ -200,7 +200,10 @@ fn collect_events(
                     lane.push(Candidate {
                         id,
                         ingest,
-                        event: SmallEvent { person, fact },
+                        event: SmallEvent {
+                            person_key: person.0,
+                            fact,
+                        },
                     });
                     true
                 }) {
@@ -291,8 +294,8 @@ fn collect_events(
 #[inline]
 fn route(mut event: SmallEvent, links: &PackedLinks, groups: &mut Buckets<SmallEvent>) {
     if event.fact.valid() {
-        event.person = links.canonical(event.person);
-        let group = shard(rustc_hash::FxBuildHasher.hash_one(event.person.0));
+        event.person_key = links.canonical(PackedName(event.person_key)).0;
+        let group = shard(rustc_hash::FxBuildHasher.hash_one(event.person_key));
         groups[group].push(event);
     }
 }
@@ -340,7 +343,7 @@ fn collect_clicks(
 }
 
 fn aggregate_small(
-    parts: Vec<Vec<SmallEvent>>,
+    mut parts: Vec<Vec<SmallEvent>>,
     clicks: Vec<Vec<SmallClick>>,
     window: &Window,
     catalogs: &Catalogs,
@@ -349,18 +352,24 @@ fn aggregate_small(
     let mut ids = FxHashMap::with_capacity_and_hasher(len / 12, Default::default());
     let mut names = Vec::new();
     let mut counts = Vec::new();
-    let mut facts = Vec::with_capacity(len);
-    for event in parts.into_iter().flatten() {
-        let id = *ids.entry(event.person).or_insert_with(|| {
+    for event in parts.iter_mut().flatten() {
+        let name = PackedName(event.person_key);
+        let id = *ids.entry(name).or_insert_with(|| {
             let id = names.len();
-            names.push(event.person);
+            names.push(name);
             counts.push(0);
             id
         });
         counts[id] += 1;
-        facts.push((id, event.fact));
+        // Once routed and interned, the full name lives in `names`. Reuse
+        // the event's key slot for its dense person index while grouping.
+        event.person_key = id as u64;
     }
-    let (events, offsets) = group_facts(counts, facts);
+    let facts = parts
+        .into_iter()
+        .flatten()
+        .map(|event| (event.person_key as usize, event.fact));
+    let (events, offsets) = group_facts(counts, len, facts);
     let clicks = clicks
         .into_iter()
         .flatten()
