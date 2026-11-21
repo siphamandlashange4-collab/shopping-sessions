@@ -120,9 +120,16 @@ struct SmallEvent {
 
 #[derive(Clone, Copy)]
 struct Candidate {
-    id: u64,
+    key: u64,
     ingest: i64,
     event: SmallEvent,
+}
+
+#[inline]
+fn event_key(id: u64) -> u64 {
+    // Odd multiplication modulo 2^64 and rotation are reversible. The
+    // complete transformed word is still an exact event identity.
+    id.wrapping_mul(0xf135_7aea_2e62_a9c5).rotate_left(26)
 }
 
 struct SmallClick {
@@ -130,56 +137,6 @@ struct SmallClick {
     offset_ms: i32,
     campaign: u32,
     id: &'static [u8],
-}
-
-#[inline]
-fn first_comma(prefix: &[u8]) -> Option<usize> {
-    let Ok(prefix) = <&[u8; 12]>::try_from(prefix) else {
-        return memchr::memchr(b',', prefix);
-    };
-
-    #[inline]
-    fn comma_mask(word: u64) -> u64 {
-        let different = word ^ u64::from_le_bytes([b','; 8]);
-        // Borrow can mark bytes above the first match. The least significant
-        // marked byte is always the first comma.
-        different.wrapping_sub(0x0101_0101_0101_0101) & !different & 0x8080_8080_8080_8080
-    }
-
-    let first = comma_mask(u64::from_le_bytes(prefix[..8].try_into().unwrap()));
-    if first != 0 {
-        return Some(first.trailing_zeros() as usize / 8);
-    }
-    let last = comma_mask(u64::from_le_bytes(prefix[4..].try_into().unwrap()));
-    (last != 0).then(|| 4 + last.trailing_zeros() as usize / 8)
-}
-
-fn scan_slots(chunks: &[&[u8]], slots: usize) -> Buckets<u32> {
-    let mut buckets = std::array::from_fn(|_| Vec::new());
-    let shift = (slots / SHARDS).trailing_zeros();
-    for chunk in chunks {
-        let mut start = 0;
-        for end in memchr::memchr_iter(b'\n', chunk).chain(std::iter::once(chunk.len())) {
-            // The longest supported first field is nine ID bytes, two
-            // optional quotes and a comma. Malformed rows may set bits
-            // here. Only the full CSV pass can admit an event.
-            let prefix = &chunk[start..end.min(start + 12)];
-            start = end + 1;
-            let Some(comma) = first_comma(prefix) else {
-                continue;
-            };
-            let field = &prefix[..comma];
-            let id = field
-                .strip_prefix(b"\"")
-                .and_then(|field| field.strip_suffix(b"\""))
-                .unwrap_or(field);
-            if let Some(id) = pack::<b'e'>(id) {
-                let slot = rustc_hash::FxBuildHasher.hash_one(id) as usize & (slots - 1);
-                buckets[slot >> shift].push(slot as u32);
-            }
-        }
-    }
-    buckets
 }
 
 #[inline]
@@ -191,6 +148,58 @@ fn mark(words: &mut [u64], index: usize) -> bool {
     already_set
 }
 
+fn route_partition(
+    pieces: Vec<Vec<Candidate>>,
+    words: usize,
+    links: &PackedLinks,
+) -> Buckets<SmallEvent> {
+    use std::collections::hash_map::Entry;
+
+    // A hash slot shared by two IDs always goes through exact deduplication.
+    let mask = words * 64 - 1;
+    let mut seen = vec![0u64; words];
+    let mut repeated = vec![0u64; words];
+    for candidate in pieces.iter().flatten() {
+        let slot = candidate.slot(mask);
+        if mark(&mut seen, slot) {
+            mark(&mut repeated, slot);
+        }
+    }
+    drop(seen);
+
+    let mut buckets = std::array::from_fn(|_| Vec::new());
+    let mut winners = FxHashMap::default();
+    for candidate in pieces.into_iter().flatten() {
+        let slot = candidate.slot(mask);
+        if repeated[slot / 64] & (1u64 << (slot % 64)) == 0 {
+            route(candidate.event, links, &mut buckets);
+            continue;
+        }
+        let value = (candidate.ingest, candidate.event);
+        match winners.entry(candidate.key) {
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            Entry::Occupied(mut entry) => {
+                if candidate.ingest < entry.get().0 {
+                    entry.insert(value);
+                }
+            }
+        }
+    }
+    for (_, event) in winners.into_values() {
+        route(event, links, &mut buckets);
+    }
+    buckets
+}
+
+impl Candidate {
+    #[inline]
+    fn slot(&self, mask: usize) -> usize {
+        self.key as usize & mask
+    }
+}
+
 fn collect_events(
     buffers: &[&'static [u8]],
     window: &Window,
@@ -199,8 +208,6 @@ fn collect_events(
 ) -> Option<[Vec<Vec<SmallEvent>>; SHARDS]> {
     let mut chunks = chunks(buffers);
     let bytes = chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
-    // Bitmap sizing depends only on input size. Hash collisions cause more
-    // exact comparisons, never a change to which event wins.
     let slots = (bytes / 16)
         .clamp(64 * SHARDS, (u32::MAX as usize / 2) + 1)
         .next_power_of_two();
@@ -211,34 +218,11 @@ fn collect_events(
         work[index % workers].push(chunk);
     }
 
-    // Collect slot numbers sequentially into small buckets. Each worker
-    // then builds the collision bitmap for one disjoint slice, keeping its
-    // working set small and avoiding shared writes and per-lane bitmaps.
-    let slots_by_shard = exchange(
-        work.par_iter().map(|chunks| scan_slots(chunks, slots)).collect(),
-    );
-    let slots_per_shard = slots / SHARDS;
-    let words_per_shard = slots_per_shard / 64;
-    let mut collided = vec![0u64; slots / 64];
-    collided
-        .par_chunks_mut(words_per_shard)
-        .zip(slots_by_shard.into_par_iter())
-        .for_each(|(collided, buckets)| {
-            let mut seen = vec![0u64; words_per_shard];
-            for slot in buckets.into_iter().flatten() {
-                let slot = slot as usize & (slots_per_shard - 1);
-                if mark(&mut seen, slot) {
-                    mark(collided, slot);
-                }
-            }
-        });
-
-    // IDs without a contested slot go straight to their person. Every copy
-    // of an ID with a contested slot enters the same exact dedup shard.
-    let (routed, possible): (Vec<_>, Vec<_>) = work
+    // Parse the CSV once and move compact rows by event ID before routing
+    // them by person. Same-ID copies always reach the same partition.
+    let candidates = work
         .into_par_iter()
         .map(|chunks| {
-            let mut people: Buckets<SmallEvent> = std::array::from_fn(|_| Vec::new());
             let mut possible: Buckets<Candidate> = std::array::from_fn(|_| Vec::new());
             for chunk in chunks {
                 if !csv::for_each::<7>(chunk, |[id, person, time, ingest, kind, product, price]| {
@@ -269,62 +253,23 @@ fn collect_events(
                         PackedName::default()
                     };
                     let event = SmallEvent { person, fact };
-                    let hash = rustc_hash::FxBuildHasher.hash_one(id);
-                    let slot = hash as usize & (slots - 1);
-                    if collided[slot / 64] & (1_u64 << (slot % 64)) != 0 {
-                        possible[shard(hash)].push(Candidate { id, ingest, event });
-                    } else {
-                        route(event, links, &mut people);
-                    }
+                    let key = event_key(id);
+                    possible[shard(key)].push(Candidate { key, ingest, event });
                     true
                 }) {
                     return None;
                 }
             }
-            Some((people, possible))
+            Some(possible)
         })
-        .collect::<Option<Vec<_>>>()?
-        .into_iter()
-        .unzip();
+        .collect::<Option<Vec<_>>>()?;
 
-    let duplicates: Vec<_> = exchange(possible)
+    let routed = exchange(candidates)
         .into_par_iter()
-        .map(|pieces| {
-            use std::collections::hash_map::Entry;
-            let size: usize = pieces.iter().map(Vec::len).sum();
-            let mut winners = FxHashMap::with_capacity_and_hasher(size, Default::default());
-            for candidate in pieces.iter().flatten() {
-                let value = (candidate.ingest, candidate.event);
-                match winners.entry(candidate.id) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(value);
-                    }
-                    Entry::Occupied(mut entry) => {
-                        if candidate.ingest < entry.get().0 {
-                            entry.insert(value);
-                        }
-                    }
-                }
-            }
-            let mut buckets = std::array::from_fn(|_| Vec::new());
-            for (_, event) in winners.into_values() {
-                route(event, links, &mut buckets);
-            }
-            buckets
-        })
+        .map(|pieces| route_partition(pieces, slots / SHARDS / 64, links))
         .collect();
-
-    let mut groups = exchange(routed);
-    for buckets in duplicates {
-        for (group, records) in groups.iter_mut().zip(buckets) {
-            if !records.is_empty() {
-                group.push(records);
-            }
-        }
-    }
-    Some(groups)
+    Some(exchange(routed))
 }
-
 #[inline]
 fn route(mut event: SmallEvent, links: &PackedLinks, groups: &mut Buckets<SmallEvent>) {
     if event.fact.valid() {
@@ -455,23 +400,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slot_scan_covers_every_supported_event_id() {
-        let chunks = [
-            &b"e1,,,x,y,z,t\n\"e12345678\",u,t,i,k,p,p\n\"e1\",u,t,i,k,p,p\n"[..],
-            &b"\"E12345678\",u,t,i,k,p,p\ninvalid\ne12345678,u,t,i,k,p,p"[..],
+    fn hash_slot_collisions_keep_distinct_ids_and_earliest_copies() {
+        let candidate = |key, ingest, fact| Candidate {
+            key,
+            ingest,
+            event: SmallEvent { person: PackedName(11), fact },
+        };
+        let pieces = vec![
+            vec![
+                candidate(10, 20, CompactFact(100)),
+                candidate(74, 30, CompactFact(200)),
+                candidate(11, 40, CompactFact(300)),
+            ],
+            vec![
+                candidate(10, 10, CompactFact::INVALID),
+                candidate(74, 15, CompactFact(400)),
+                candidate(138, 20, CompactFact(500)),
+            ],
         ];
-        let slots = 4096;
-        let mut expected = Vec::new();
-        for chunk in chunks {
-            csv::for_each::<7>(chunk, |fields| {
-                let id = pack::<b'e'>(fields[0]).unwrap();
-                expected.push((rustc_hash::FxBuildHasher.hash_one(id) as usize & (slots - 1)) as u32);
-                true
-            });
-        }
-        let mut actual: Vec<_> = scan_slots(&chunks, slots).into_iter().flatten().collect();
-        actual.sort_unstable();
-        expected.sort_unstable();
-        assert_eq!(actual, expected);
+        let links = PackedLinks(FxHashMap::default());
+        let mut facts: Vec<_> = route_partition(pieces, 1, &links)
+            .into_iter()
+            .flatten()
+            .map(|event| event.fact.0)
+            .collect();
+        facts.sort_unstable();
+        assert_eq!(facts, [300, 400, 500]);
     }
 }
