@@ -5,9 +5,10 @@
 
 mod attribution;
 mod csv;
+mod fast;
 mod ts;
 
-use attribution::{Attribution, CampaignTable, CampaignTotals, Click};
+use attribution::{Attribution, CampaignTable, CampaignTotals, Click, GroupedClicks};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::fs;
@@ -41,13 +42,42 @@ fn read_dir_csvs(dir: &Path) -> Vec<&'static [u8]> {
         Err(_) => Vec::new(),
     };
     paths.sort();
-    paths
-        .par_iter()
-        .map(|p| {
-            let v = fs::read(p).unwrap_or_default();
-            &*Box::leak(v.into_boxed_slice()) as &'static [u8]
-        })
-        .collect()
+    paths.into_par_iter().map(|path| read_log(&path)).collect()
+}
+
+fn read_log(path: &Path) -> &'static [u8] {
+    #[cfg(target_os = "linux")]
+    if let Some(bytes) = map_log(path) {
+        return bytes;
+    }
+    read_file(path)
+}
+
+#[cfg(target_os = "linux")]
+fn map_log(path: &Path) -> Option<&'static [u8]> {
+    use std::os::fd::AsRawFd;
+    let file = fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let len = usize::try_from(metadata.len()).ok()?;
+    if !metadata.is_file() || !(64 * 1024..=isize::MAX as usize).contains(&len) {
+        return None;
+    }
+    // The pipeline's input files are immutable for the run. The private,
+    // read-only mapping remains valid until the process exits.
+    let address = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if address == libc::MAP_FAILED || address.is_null() {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(address.cast(), len) })
 }
 
 fn read_file(path: &Path) -> &'static [u8] {
@@ -431,6 +461,42 @@ fn pack_id<const PREFIX: u8>(id: &[u8]) -> u64 {
     0
 }
 
+#[inline]
+fn event_fact<F: Fact>(
+    window: &Window,
+    products: &FxHashMap<&'static [u8], u32>,
+    unknown: u32,
+    user: &[u8],
+    time: &[u8],
+    ingest: i64,
+    kind: &[u8],
+    product: &[u8],
+    price: &[u8],
+) -> F {
+    if user.is_empty() || product.is_empty() || ingest == BAD_TS {
+        return F::INVALID;
+    }
+    let Some(time) = ts::parse(time).filter(|time| (window.start..window.end).contains(time))
+    else {
+        return F::INVALID;
+    };
+    if ingest - time > LATE_MS {
+        return F::INVALID;
+    }
+    match kind {
+        b"view" | b"cart" => F::encode(window, time, 0, 0),
+        b"purchase" if csv::all_digits(price) => {
+            let amount = csv::parse_u64(price);
+            if !(1..=10_000_000).contains(&amount) {
+                return F::INVALID;
+            }
+            let category = products.get(product).copied().unwrap_or(unknown);
+            F::encode(window, time, amount as u32, category)
+        }
+        _ => F::INVALID,
+    }
+}
+
 fn user_events<F: Fact>(
     buffers: &[&'static [u8]],
     window: &Window,
@@ -450,29 +516,10 @@ fn user_events<F: Fact>(
                     continue;
                 }
                 let ingest = ts::parse(ingest).unwrap_or(BAD_TS);
-                let time = ts::parse(time).unwrap_or(BAD_TS);
-                let mut event = Event {
-                    user,
-                    fact: F::INVALID,
-                };
-                if !user.is_empty()
-                    && !product.is_empty()
-                    && ingest != BAD_TS
-                    && (window.start..window.end).contains(&time)
-                    && ingest - time <= LATE_MS
-                {
-                    match kind {
-                        b"view" | b"cart" => event.fact = F::encode(window, time, 0, 0),
-                        b"purchase" if csv::all_digits(price) => {
-                            let amount = csv::parse_u64(price);
-                            if (1..=10_000_000).contains(&amount) {
-                                let category = products.get(product).copied().unwrap_or(unknown);
-                                event.fact = F::encode(window, time, amount as u32, category);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                let fact = event_fact(
+                    window, products, unknown, user, time, ingest, kind, product, price,
+                );
+                let event = Event { user, fact };
                 // Invalid rows still participate in the earliest-ingest election.
                 let packed = pack_id::<b'e'>(id);
                 if packed == 0 {
@@ -606,8 +653,8 @@ struct UserDay {
 }
 
 #[derive(Default)]
-struct UserRows {
-    names: Vec<&'static str>,
+struct UserRows<N> {
+    names: Vec<N>,
     day: Vec<i32>,
     sessions: Vec<i64>,
     events: Vec<i64>,
@@ -615,8 +662,18 @@ struct UserRows {
     category: Vec<Option<&'static str>>,
 }
 
-impl UserRows {
-    fn push(&mut self, name: &'static str, day: &UserDay, categories: &[&'static str]) {
+trait OutputName: Copy + Default + Send {
+    fn string_array(names: Vec<Self>) -> StringArray;
+}
+
+impl OutputName for &'static str {
+    fn string_array(names: Vec<Self>) -> StringArray {
+        StringArray::from_iter_values(names)
+    }
+}
+
+impl<N: OutputName> UserRows<N> {
+    fn push(&mut self, name: N, day: &UserDay, categories: &[&'static str]) {
         self.names.push(name);
         self.day.push(day.day);
         self.sessions.push(day.sessions);
@@ -633,7 +690,7 @@ fn aggregate<F: Fact>(
     categories: &[&'static str],
     campaign_count: usize,
     window: &Window,
-) -> (UserRows, CampaignTable) {
+) -> (UserRows<&'static str>, CampaignTable) {
     let num_events = event_parts.iter().map(Vec::len).sum::<usize>();
     let mut names = UserInterner::with_capacity(num_events / 12);
     let mut named_events = Vec::with_capacity(num_events);
@@ -646,22 +703,8 @@ fn aggregate<F: Fact>(
         counts[user] += 1;
         named_events.push((user, event.fact));
     }
-    // Group by the dense person ID in linear time, then sort only within people.
-    let mut end = 0;
-    let mut offsets: Vec<_> = counts
-        .into_iter()
-        .map(|count| {
-            let start = end;
-            end += count;
-            start
-        })
-        .collect();
-    let mut events = vec![F::default(); num_events];
-    for (user, event) in named_events {
-        events[offsets[user]] = event;
-        offsets[user] += 1;
-    }
-    let mut clicks: Vec<_> = click_parts
+    let (events, offsets) = group_facts(counts, named_events);
+    let clicks: Vec<_> = click_parts
         .into_iter()
         .flatten()
         .filter_map(|click| {
@@ -673,22 +716,57 @@ fn aggregate<F: Fact>(
             })
         })
         .collect();
-    clicks.sort_unstable_by(|a, b| {
-        a.user
-            .cmp(&b.user)
-            .then(a.time.cmp(&b.time))
-            .then_with(|| b.id.cmp(a.id))
-    });
+    let names = names
+        .vals
+        .into_iter()
+        .map(|name| std::str::from_utf8(name).expect("UTF-8 user ID"));
+    summarize(
+        events,
+        offsets,
+        names,
+        clicks,
+        categories,
+        campaign_count,
+        window,
+    )
+}
 
+// Group by the dense person ID in linear time, then sort only within people.
+fn group_facts<F: Fact>(counts: Vec<usize>, named_events: Vec<(usize, F)>) -> (Vec<F>, Vec<usize>) {
+    let mut end = 0;
+    let mut offsets: Vec<_> = counts
+        .into_iter()
+        .map(|count| {
+            let start = end;
+            end += count;
+            start
+        })
+        .collect();
+    let mut events = vec![F::default(); named_events.len()];
+    for (user, event) in named_events {
+        events[offsets[user]] = event;
+        offsets[user] += 1;
+    }
+    (events, offsets)
+}
+
+fn summarize<F: Fact, N: OutputName>(
+    mut events: Vec<F>,
+    offsets: Vec<usize>,
+    names: impl Iterator<Item = N>,
+    clicks: Vec<Click>,
+    categories: &[&'static str],
+    campaign_count: usize,
+    window: &Window,
+) -> (UserRows<N>, CampaignTable) {
+    let mut clicks = GroupedClicks::new(clicks, offsets.len());
     let mut rows = UserRows::default();
     let mut campaign_totals = window.campaign_table(campaign_count);
     let mut attribution = Attribution::new(campaign_count);
     let mut category_totals = vec![0; categories.len()];
     let mut touched = Vec::new();
-    let mut click_pos = 0;
     let mut event_pos = 0;
-    for (user, end) in offsets.into_iter().enumerate() {
-        let user = user as u32;
+    for (user, (end, name)) in offsets.into_iter().zip(names).enumerate() {
         let user_events = &mut events[event_pos..end];
         event_pos = end;
         if user_events.len() >= 32_768 {
@@ -696,12 +774,7 @@ fn aggregate<F: Fact>(
         } else {
             user_events.sort_unstable_by_key(|e| e.order());
         }
-        let name = std::str::from_utf8(names.name(user)).expect("UTF-8 user ID");
-        let first = click_pos;
-        while click_pos < clicks.len() && clicks[click_pos].user == user {
-            click_pos += 1;
-        }
-        let user_clicks = &clicks[first..click_pos];
+        let user_clicks = clicks.for_user(user as u32);
         attribution.reset();
         let mut day = UserDay::default();
         let sessions = user_events.chunk_by(|a, b| b.order() - a.order() <= SESSION_GAP_MS);
@@ -765,11 +838,11 @@ fn user_schema() -> Arc<Schema> {
     ]))
 }
 
-fn write_user_rows(path: &Path, rows: UserRows, schema: Arc<Schema>) {
+fn write_user_rows<N: OutputName>(path: &Path, rows: UserRows<N>, schema: Arc<Schema>) {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(StringArray::from_iter_values(rows.names)),
+            Arc::new(N::string_array(rows.names)),
             Arc::new(Date32Array::from(rows.day)),
             Arc::new(Int64Array::from(rows.sessions)),
             Arc::new(Int64Array::from(rows.events)),
@@ -930,6 +1003,11 @@ fn run_pipeline<F: Fact>(data: &Path, outdir: &Path, window: &Window, catalogs: 
             )
         },
     );
+    if CompactFact::fits(window, catalogs.categories.len())
+        && fast::try_pipeline(&event_bufs, &click_bufs, &links, window, catalogs, outdir).is_some()
+    {
+        return;
+    }
     let (events, clicks) = rayon::join(
         || {
             user_events::<F>(
@@ -942,24 +1020,32 @@ fn run_pipeline<F: Fact>(data: &Path, outdir: &Path, window: &Window, catalogs: 
         },
         || user_clicks(&click_bufs, window, &links, &catalogs.campaigns),
     );
+    let parts = events.into_par_iter().zip(clicks).map(|(events, clicks)| {
+        aggregate(
+            events,
+            clicks,
+            &catalogs.categories,
+            catalogs.channels.len(),
+            window,
+        )
+    });
+    write_results(outdir, catalogs, parts);
+}
+
+fn write_results<N: OutputName>(
+    outdir: &Path,
+    catalogs: &Catalogs,
+    parts: impl IndexedParallelIterator<Item = (UserRows<N>, CampaignTable)>,
+) {
     let user_dir = outdir.join("user_daily");
     let campaign_dir = outdir.join("campaign_daily");
     fs::create_dir_all(&user_dir).expect("create user_daily");
     fs::create_dir_all(&campaign_dir).expect("create campaign_daily");
 
     let schema = user_schema();
-    let totals = events
-        .into_par_iter()
-        .zip(clicks)
+    let totals = parts
         .enumerate()
-        .map(|(part, (events, clicks))| {
-            let (rows, totals) = aggregate(
-                events,
-                clicks,
-                &catalogs.categories,
-                catalogs.channels.len(),
-                window,
-            );
+        .map(|(part, (rows, totals))| {
             let path = user_dir.join(format!("part-{part}.parquet"));
             if part == 0 || !rows.names.is_empty() {
                 write_user_rows(&path, rows, schema.clone());

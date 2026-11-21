@@ -4,11 +4,51 @@ use std::ops::AddAssign;
 const SEVEN_DAYS_MS: i64 = 7 * 86_400_000;
 const ORGANIC: u32 = 0;
 
+#[derive(Clone, Copy, Default)]
 pub struct Click {
     pub user: u32,
     pub campaign: u32,
     pub time: i64,
     pub id: &'static [u8],
+}
+
+pub struct GroupedClicks {
+    rows: Vec<Click>,
+    ends: Vec<usize>,
+}
+
+impl GroupedClicks {
+    pub fn new(clicks: Vec<Click>, users: usize) -> Self {
+        let mut ends = vec![0; users];
+        for click in &clicks {
+            ends[click.user as usize] += 1;
+        }
+
+        let mut next = Vec::with_capacity(users);
+        let mut end = 0;
+        for count in &mut ends {
+            next.push(end);
+            end += *count;
+            *count = end;
+        }
+
+        let mut rows = vec![Click::default(); clicks.len()];
+        for click in clicks {
+            let offset = &mut next[click.user as usize];
+            rows[*offset] = click;
+            *offset += 1;
+        }
+        Self { rows, ends }
+    }
+
+    /// Sort just this person's clicks, placing the smallest ID last on a tie.
+    pub fn for_user(&mut self, user: u32) -> &[Click] {
+        let user = user as usize;
+        let start = if user == 0 { 0 } else { self.ends[user - 1] };
+        let rows = &mut self.rows[start..self.ends[user]];
+        rows.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| b.id.cmp(a.id)));
+        rows
+    }
 }
 
 #[derive(Default)]

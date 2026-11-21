@@ -12,8 +12,8 @@ in, counts assisting campaigns from the week before, and writes
 Rust rather than a dataframe engine, to avoid interpreter and engine start-up
 cost: the clock runs from container start to container exit.
 
-1. **Read** every input file into memory and leak the buffers, so all later
-   stages work on `&'static [u8]` slices with no copying.
+1. **Read** all input files as borrowed byte ranges. On Linux, large immutable
+   logs are mapped read-only so workers can scan them without a heap copy.
 2. **Parse** events and clicks in parallel over line-aligned chunks with a
    hand-written CSV reader matching the spec's dialect exactly: `\n` only ends a
    line, `\r` is an ordinary character, quotes are syntax only when they wrap a
@@ -22,12 +22,14 @@ cost: the clock runs from container start to container exit.
 3. **Timestamps** are parsed by hand for the three accepted forms (F1 UTC, F2
    offset, F3 epoch millis), with full calendar validation including leap years.
    An F3 value too large for `i64` is treated as valid but outside the window.
-4. **Dedup** events in independent ID shards. Every well-formed copy takes
-   part in the earliest-ingest selection, so an invalid winner drops the event.
+4. **Dedup** events with exact ID comparisons. The compact path uses a hash-slot
+   bitmap to send uncontested IDs directly to their person. Potential copies
+   enter ID shards for exact earliest-ingest selection, including invalid
+   candidates. Other ID shapes use the full byte-string path.
 5. **Link** user IDs with union-find. Each person is named by the byte-wise
    smallest ID in their component. Events and clicks are routed by that name.
-6. **Sessionize** in parallel by person shard. Count events by person to group
-   them in linear time, then sort each person's slice by timestamp. Start a new
+6. **Sessionize** in parallel by person shard. Group events and clicks by person
+   in linear time, then sort each person's slices by timestamp. Start a new
    session when the gap exceeds 30 minutes.
 7. **Attribute** sessions with a sliding seven-day click window. The latest
    qualifying time and smallest click ID determine credit. Counts per campaign

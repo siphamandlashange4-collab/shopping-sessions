@@ -5,6 +5,11 @@
 //! fields. Wrong field count, or a quote anywhere except around a whole field,
 //! is malformed. An empty line is malformed.
 
+#[path = "csv_fast.rs"]
+mod fast;
+
+pub use fast::for_each;
+
 /// Unquote one field. Returns None if the field is malformed.
 #[inline]
 pub fn unquote(f: &[u8]) -> Option<&[u8]> {
