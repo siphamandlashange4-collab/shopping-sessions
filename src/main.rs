@@ -10,6 +10,10 @@ mod plain_parquet;
 mod time_bins;
 mod ts;
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use attribution::{Attribution, CampaignTable, CampaignTotals, Click, GroupedClicks};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -193,15 +197,19 @@ struct WideFact {
 }
 
 trait Fact: Copy + Default + Send + Sync {
+    type SortKey: Ord;
     const INVALID: Self;
     fn encode(window: &Window, time: i64, price: u32, category: u32) -> Self;
     fn valid(self) -> bool;
     fn order(self) -> i64;
+    fn sort_key(self) -> Self::SortKey;
     fn time(self, window: &Window) -> i64;
     fn purchase(self) -> (u32, u32);
 }
 
 impl Fact for WideFact {
+    type SortKey = i64;
+
     const INVALID: Self = Self {
         time: BAD_TS,
         price: 0,
@@ -224,6 +232,11 @@ impl Fact for WideFact {
 
     #[inline]
     fn order(self) -> i64 {
+        self.time
+    }
+
+    #[inline]
+    fn sort_key(self) -> i64 {
         self.time
     }
 
@@ -256,6 +269,8 @@ impl CompactFact {
 }
 
 impl Fact for CompactFact {
+    type SortKey = u64;
+
     const INVALID: Self = Self(u64::MAX);
 
     #[inline]
@@ -275,6 +290,13 @@ impl Fact for CompactFact {
     #[inline]
     fn order(self) -> i64 {
         (self.0 >> Self::TIME_SHIFT) as i64
+    }
+
+    #[inline]
+    fn sort_key(self) -> u64 {
+        // Timestamp bits come first. The payload only orders equal times,
+        // whose contributions to session counts and sums commute.
+        self.0
     }
 
     #[inline]
@@ -871,9 +893,9 @@ fn summarize<F: Fact, N: OutputName>(
         }
 
         if user_events.len() >= 32_768 {
-            user_events.par_sort_unstable_by_key(|e| e.order());
+            user_events.par_sort_unstable_by_key(|e| e.sort_key());
         } else {
-            user_events.sort_unstable_by_key(|e| e.order());
+            user_events.sort_unstable_by_key(|e| e.sort_key());
         }
         let sessions = user_events.chunk_by(|a, b| b.order() - a.order() <= SESSION_GAP_MS);
         for session in sessions {
