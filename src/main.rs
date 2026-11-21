@@ -32,11 +32,7 @@ const BAD_TS: i64 = i64::MIN;
 
 const SHARDS: usize = 32;
 
-// mimalloc keeps per-thread heaps (no arena lock when many threads grow their
-// buckets at once) and carves memory from large aligned segments, which the
-// kernel can back with huge pages when MIMALLOC_ALLOW_LARGE_OS_PAGES is set.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 static TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

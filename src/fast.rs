@@ -357,6 +357,45 @@ impl Candidate {
 
 type CandidatePartitions = [Vec<Vec<Candidate>>; SHARDS];
 
+/// Candidates per block: 128 KB. Buckets grow a block at a time, so nothing
+/// is ever copied as they grow and at most one partly filled block per shard
+/// is wasted. With huge pages, a generously pre-sized bucket would instead be
+/// faulted in (and zeroed by the kernel) far beyond what it ever holds.
+const BLOCK: usize = 4096;
+
+struct Blocks {
+    current: [Vec<Candidate>; SHARDS],
+    full: [Vec<Vec<Candidate>>; SHARDS],
+}
+
+impl Blocks {
+    fn new() -> Self {
+        Self {
+            current: std::array::from_fn(|_| Vec::with_capacity(BLOCK)),
+            full: std::array::from_fn(|_| Vec::new()),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, shard: usize, candidate: Candidate) {
+        let current = &mut self.current[shard];
+        current.push(candidate);
+        if current.len() == BLOCK {
+            let block = std::mem::replace(current, Vec::with_capacity(BLOCK));
+            self.full[shard].push(block);
+        }
+    }
+
+    fn finish(mut self) -> [Vec<Vec<Candidate>>; SHARDS] {
+        for (full, current) in self.full.iter_mut().zip(self.current) {
+            if !current.is_empty() {
+                full.push(current);
+            }
+        }
+        self.full
+    }
+}
+
 fn collect_candidates(
     buffers: &[&'static [u8]],
     window: &Window,
@@ -367,24 +406,16 @@ fn collect_candidates(
     let slots = (bytes / 16)
         .clamp(64 * SHARDS, (u32::MAX as usize / 2) + 1)
         .next_power_of_two();
-    // Reserve generously: untouched capacity is only address space, and it
-    // saves the copy of every doubling as the buckets grow.
-    let threads = rayon::current_num_threads().max(1);
-    let per_bucket = (bytes / 64 / SHARDS / threads) * 5 / 4 + 1024;
 
     // Parse the CSV once and move compact rows by event ID before routing
     // them by person. Same-ID copies always reach the same partition.
     // `fold` keeps one set of buckets per stolen piece of work, so every
     // thread pulls 2 MB chunks until the input runs out instead of owning a
     // fixed share of it.
-    let candidates = chunks
+    let pieces = chunks
         .par_iter()
         .fold(
-            || {
-                Some(std::array::from_fn::<Vec<Candidate>, SHARDS, _>(|_| {
-                    Vec::with_capacity(per_bucket)
-                }))
-            },
+            || Some(Blocks::new()),
             |possible, &chunk| {
                 let mut possible = possible?;
                 let ok = csv::for_each::<7>(chunk, |[id, person, time, ingest, kind, product, price]| {
@@ -416,7 +447,7 @@ fn collect_candidates(
                     };
                     let event = SmallEvent { person, fact };
                     let key = event_key(id);
-                    possible[shard(key)].push(Candidate { key, ingest, event });
+                    possible.push(shard(key), Candidate { key, ingest, event });
                     true
                 });
                 crate::release_input(chunk);
@@ -425,7 +456,13 @@ fn collect_candidates(
         )
         .collect::<Option<Vec<_>>>()?;
 
-    Some((exchange(candidates), slots / SHARDS / 64))
+    let mut partitions: CandidatePartitions = std::array::from_fn(|_| Vec::new());
+    for piece in pieces {
+        for (partition, blocks) in partitions.iter_mut().zip(piece.finish()) {
+            partition.extend(blocks);
+        }
+    }
+    Some((partitions, slots / SHARDS / 64))
 }
 
 #[inline]

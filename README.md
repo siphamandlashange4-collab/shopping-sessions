@@ -49,7 +49,6 @@ Open-source crates used, all from crates.io:
 - `rustc-hash` — FxHash maps for interning and dedup
 - `memchr` — SIMD byte search for the CSV reader
 - `libc` — read-only `mmap` of the input logs on Linux
-- `mimalloc` — global allocator: per-thread heaps, and segments the kernel can back with huge pages
 - `parquet`, `arrow-array`, `arrow-schema` — Parquet output
 
 No code was reused from before the event.
