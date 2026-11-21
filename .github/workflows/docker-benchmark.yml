@@ -1,4 +1,4 @@
-name: Shopping Sessions parallel link resolution benchmark
+name: Shopping Sessions optimized compiler build benchmark
 on:
   create:
   push:
@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: shopping-sessions-overlap-bench
+  group: shopping-sessions-onepass-pgo-bench
   cancel-in-progress: true
 jobs:
   benchmark:
@@ -21,8 +21,8 @@ jobs:
           mkdir ci
           cd ci
           git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
-          git -C src worktree add --detach "$PWD/baseline" 6b3079af79e431ca0ef4f64908b4454106ccfed8
-          git -C src worktree add --detach "$PWD/candidate" 80a86150b180280c1cd5115ffc0985add9532ef5
+          git -C src worktree add --detach "$PWD/baseline" 80a86150b180280c1cd5115ffc0985add9532ef5
+          git -C src worktree add --detach "$PWD/candidate" 2488b0505615618b457744772e90e138aa695e58
           docker build --platform linux/amd64 -t shopping-sessions:baseline baseline
           docker build --platform linux/amd64 -t shopping-sessions:candidate candidate
           docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' shopping-sessions:baseline shopping-sessions:candidate
