@@ -34,8 +34,8 @@ jobs:
             curl --fail --silent --show-error --location --retry 2 "$files/$file" -o "$file"
           done
           sha256sum -c <<'EOF'
-          13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  generator.zip
-          7eb8e1f0b1f431d178d28ac9437ce85809c44eb6393fdd42fb59857f30834fa9  dev-answer.zip
+          78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip
+          c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip
           EOF
           for zip in *.zip; do unzip -q "$zip"; done
           cargo build --locked --release --manifest-path generator/Cargo.toml
