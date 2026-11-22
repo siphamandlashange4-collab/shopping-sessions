@@ -87,37 +87,37 @@ unsafe fn decode<const N: usize>(
         return None;
     }
 
+    // Most rows hold a quoted field somewhere, so the quote checks run on
+    // every row instead of behind a branch that would often guess wrong.
+    // Without quotes both gathers are zero and every check passes.
     let quote = quote & (terminal - 1);
-    let mut quoted = 0;
-    if quote != 0 {
-        let starts = (comma << 1) | 1;
-        let last = ends >> 1;
-        // A quote may touch only the first or last byte of a field. A quote
-        // touching both is a one-byte field and can't have a matching quote.
-        if quote & (!(starts | last) | (starts & last)) != 0 {
-            return None;
-        }
-        // Gather opening and closing quote flags in field order.
-        quoted = compress_bits(quote, starts);
-        if quoted != compress_bits(quote << 1, ends) {
-            return None;
-        }
+    let starts = (comma << 1) | 1;
+    let last = ends >> 1;
+    // A quote may touch only the first or last byte of a field. A quote
+    // touching both is a one-byte field and can't have a matching quote.
+    // Gather opening and closing quote flags in field order.
+    let mut quoted = compress_bits(quote, starts);
+    if quote & (!(starts | last) | (starts & last)) != 0 || quoted != compress_bits(quote << 1, ends)
+    {
+        return None;
     }
 
+    // Field ends come from the low word and then the high word. Choosing
+    // with selects rather than a branch avoids a misprediction per row at
+    // the field where the low word runs out.
     let mut low = ends as u64;
     let mut high = (ends >> 64) as u64;
     let mut start = 0;
     let mut fields = [b"" as &[u8]; N];
     for field in &mut fields {
-        let end = if low != 0 {
-            let idx = low.trailing_zeros() as usize;
-            low &= low - 1;
-            idx
-        } else {
-            let idx = high.trailing_zeros() as usize + 64;
-            high &= high - 1;
-            idx
-        };
+        let low_done = low == 0;
+        let end = std::hint::select_unpredictable(
+            low_done,
+            high.trailing_zeros() as usize + 64,
+            low.trailing_zeros() as usize,
+        );
+        high = std::hint::select_unpredictable(low_done, high & high.wrapping_sub(1), high);
+        low &= low.wrapping_sub(1);
         let trim = (quoted & 1) as usize;
         quoted >>= 1;
         // The exact field count and paired quotes were checked above. Each
@@ -187,6 +187,59 @@ unsafe fn for_each_x86<'a, const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_rows_match_the_reference_on_random_text() {
+        // Lines of random fields with stray and paired quotes, empty fields
+        // and lengths around the 64- and 128-byte boundaries.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..400 {
+            let mut text = Vec::new();
+            for _ in 0..(1 + next() % 40) {
+                let fields = 5 + next() % 4;
+                for f in 0..fields {
+                    if f > 0 {
+                        text.push(b',');
+                    }
+                    let len = (next() % 40) as usize;
+                    let quoted = next() % 5 == 0;
+                    if quoted {
+                        text.push(b'"');
+                    }
+                    for _ in 0..len {
+                        let r = next() % 64;
+                        text.push(match r {
+                            0 => b'"',
+                            1 => b'\r',
+                            _ => b'a' + (r % 26) as u8,
+                        });
+                    }
+                    if quoted && next() % 7 != 0 {
+                        text.push(b'"');
+                    }
+                }
+                if next() % 50 != 0 {
+                    text.push(b'\n');
+                }
+            }
+            for start in [0, 1, 7, 63] {
+                let bytes = &text[start.min(text.len())..];
+                let expected: Vec<_> = Rows::<7>::raw(bytes).collect();
+                let mut received = Vec::new();
+                assert!(for_each::<7>(bytes, |row| {
+                    received.push(row);
+                    true
+                }));
+                assert_eq!(received, expected, "round {round} start {start}");
+            }
+        }
+    }
 
     #[test]
     fn fast_rows_match_on_quotes_and_lengths() {
