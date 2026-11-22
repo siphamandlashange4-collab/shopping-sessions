@@ -1,0 +1,124 @@
+name: Claude matched benchmark
+on:
+  push:
+    branches: [buildathon-claude-bench]
+permissions:
+  contents: write
+concurrency:
+  group: claude-bench
+  cancel-in-progress: false
+jobs:
+  benchmark:
+    if: ${{ !startsWith(github.event.head_commit.message, 'Benchmark result') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the request
+        uses: actions/checkout@v4
+      - name: Build every image
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r -a SHAS < bench/shas.txt
+          mkdir -p ci
+          git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" ci/src
+          for sha in "${SHAS[@]}"; do
+            git -C ci/src worktree add --detach "$PWD/ci/$sha" "$sha"
+            docker build -q --platform linux/amd64 -t "ss:$sha" "ci/$sha"
+          done
+          { nproc; lscpu | sed -n '/Model name/p'; free -h | head -2; } | tee ci/machine.txt
+      - name: Generate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ci
+          files=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for file in generator.zip dev-answer.zip starter-polars.zip; do
+            curl --fail --silent --show-error --location --retry 2 "$files/$file" -o "$file"
+          done
+          sha256sum generator.zip dev-answer.zip
+          for zip in *.zip; do unzip -q -o "$zip"; done
+          cargo build --locked --release --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+          generator/target/release/generate --seed 41 --events 20000000 --clicks 5000000 --output practice
+          generator/target/release/generate --seed 77 --events 60000000 --clicks 15000000 --output final
+          python3 -m venv .venv
+          .venv/bin/pip install -q -r starter-polars/requirements.txt
+      - name: Check, time and measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r -a SHAS < bench/shas.txt
+          read -r CYCLES20 CYCLES60 < bench/cycles.txt
+          cd ci
+          out=../bench/result-$GITHUB_RUN_ID.txt
+          cat machine.txt > "$out"
+          CPUS=4
+          run() {  # sha input output ncpu
+            docker run --rm --platform linux/amd64 --network none --read-only \
+              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges \
+              --pids-limit 4096 --cpus "$CPUS" --memory 14g --memory-swap 14g --user 1000:1000 \
+              -v "$PWD/$2":/data:ro -v "$PWD/$3":/output -v "$PWD/scratch":/scratch \
+              -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+              -e NCPU="$4" -e MEM_GB=14 "ss:$1"
+          }
+          mkdir -m 777 -p scratch
+          for sha in "${SHAS[@]}"; do
+            for input in dev practice final; do
+              rm -rf "o-$input-$sha"; mkdir -m 777 "o-$input-$sha"
+              run "$sha" "$input" "o-$input-$sha" 8
+            done
+            echo "$sha dev vs official: $(.venv/bin/python starter-polars/scripts/compare.py o-dev-$sha dev-answer 2>&1 | tail -1)" >> "$out"
+            if [ "$sha" != "${SHAS[0]}" ]; then
+              for input in practice final; do
+                echo "$sha $input vs ${SHAS[0]}: $(.venv/bin/python starter-polars/scripts/compare.py o-$input-$sha o-$input-${SHAS[0]} 2>&1 | tail -1)" >> "$out"
+              done
+            fi
+          done
+          mkdir -m 777 -p timed
+          timeit() {  # input cycles
+            for ((cycle=0; cycle<$2; cycle++)); do
+              n=${#SHAS[@]}
+              for ((k=0; k<n; k++)); do
+                sha=${SHAS[$(( (k + cycle) % n ))]}
+                s=$(date +%s.%N)
+                run "$sha" "$1" timed 8
+                e=$(date +%s.%N)
+                echo "$1 $sha $(echo "$e - $s" | bc)" >> timings.txt
+              done
+            done
+          }
+          timeit practice "$CYCLES20"
+          timeit final "$CYCLES60"
+          cat timings.txt >> "$out"
+          python3 - >> "$out" <<'PY'
+          from collections import defaultdict
+          from statistics import median
+          t = defaultdict(list)
+          for line in open("timings.txt"):
+              d, s, x = line.split()
+              t[d, s].append(float(x))
+          for (d, s), xs in sorted(t.items()):
+              print(f"SUMMARY {d} {s[:7]} median {median(xs):.3f} min {min(xs):.3f} n {len(xs)}")
+          PY
+          for sha in "${SHAS[@]}"; do
+            rm -rf memory-out; mkdir -m 777 memory-out
+            docker run --rm --platform linux/amd64 --network none --read-only \
+              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges \
+              --pids-limit 4096 --cpus "$CPUS" --memory 14g --memory-swap 14g --user 1000:1000 \
+              -v "$PWD/final":/data:ro -v "$PWD/memory-out":/output -v "$PWD/scratch":/scratch \
+              -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+              -e NCPU=8 -e MEM_GB=14 --entrypoint /bin/sh "ss:$sha" \
+              -c '/app/run.sh && cat /sys/fs/cgroup/memory.peak' > mem.txt
+            echo "MEMORY $sha 60M peak bytes $(tail -1 mem.txt)" >> "$out"
+          done
+      - name: Publish the result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "bench"
+          git config user.email "bench@example.invalid"
+          git add bench/result-*.txt || true
+          git commit -q -m "Benchmark result $GITHUB_RUN_ID" || exit 0
+          for i in 1 2 3; do git pull -q --rebase origin buildathon-claude-bench && git push -q origin HEAD:buildathon-claude-bench && break; sleep 5; done
