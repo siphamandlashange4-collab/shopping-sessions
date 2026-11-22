@@ -23,15 +23,22 @@ cost: the clock runs from container start to container exit.
 3. **Timestamps** are parsed by hand for the three accepted forms (F1 UTC, F2
    offset, F3 epoch millis), with full calendar validation including leap years.
    An F3 value too large for `i64` is treated as valid but outside the window.
-4. **Dedup** events with exact ID comparisons. The compact path first scans
-   event IDs and marks contested hash slots in cache-sized partitions. The
-   full CSV pass sends uncontested events directly to their person and uses
-   exact earliest-ingest selection for contested slots, including invalid
-   candidates. Other ID shapes use the full byte-string path.
-5. **Link** user IDs with union-find. Each person is named by the byte-wise
-   smallest ID in their component, stored in a flat open-addressed table so
-   the slot for an event or click sixteen rows ahead can be prefetched while
-   the current one is routed. Events and clicks are routed by that name.
+4. **Dedup** events with exact ID comparisons. IDs are opaque variable-width
+   strings. A short ID is packed losslessly into one machine word; any other
+   ID (such as a 32-character hex one) is deduplicated on its exact bytes. For
+   packed IDs the compact path first marks contested hash slots in
+   cache-sized partitions, sends uncontested events directly to their person,
+   and uses exact earliest-ingest selection for contested slots, including
+   invalid candidates.
+5. **Link** user IDs with union-find. A user ID that does not pack gets a
+   word-sized name from a hash of its bytes; every such name is checked
+   against the exact bytes of every ID that produced it, and the run falls
+   back to a full byte-string pipeline if two distinct IDs ever share one.
+   Each person is named by the byte-wise smallest ID in their component,
+   stored in a flat open-addressed table, kept at most about 40% full so a
+   lookup for an unlinked ID ends quickly, where the slot for an event or
+   click 32 rows ahead can be prefetched while the current one is routed.
+   Events and clicks are routed by that name.
 6. **Sessionize** in parallel by person shard. Group events and clicks by person
    in linear time, then sort each person's slices by timestamp. Start a new
    session when the gap exceeds 30 minutes.
