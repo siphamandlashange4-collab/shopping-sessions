@@ -1,0 +1,122 @@
+name: Shopping Sessions three-way Docker benchmark
+on:
+  push:
+    branches: [buildathon-combined-docker-bench]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: shopping-sessions-combined
+  cancel-in-progress: true
+jobs:
+  benchmark:
+    if: github.ref == 'refs/heads/buildathon-combined-docker-bench'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - name: Build the three exact scorer candidates
+        shell: bash
+        run: |
+          mkdir ci
+          cd ci
+          git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
+          git -C src worktree add --detach "$PWD/baseline" 7304c6941443e9cd98616f4d5e9f8e34ac99e7fa
+git -C src worktree add --detach "$PWD/tuned" 27b818820305239fc9a7f9bfc16ef6227181bd88
+          git -C src worktree add --detach "$PWD/combined" 9a751d73a6245fc1b3a35623b69be98fac1dfa59
+          for version in baseline tuned combined; do
+            docker build --platform linux/amd64 -t "shopping-sessions:$version" "$version"
+            docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' "shopping-sessions:$version"
+          done
+          nproc
+          lscpu | sed -n '/Model name/p'
+          if grep -qm1 avx512bw /proc/cpuinfo; then echo 'AVX-512BW available'; else echo 'AVX-512BW unavailable'; fi
+          free -h
+          df -h .
+      - name: Generate official dev and synthetic practice-scale inputs
+        shell: bash
+        run: |
+          cd ci
+          files=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for file in generator.zip dev-answer.zip starter-polars.zip; do
+            curl --fail --silent --show-error --location --retry 2 "$files/$file" -o "$file"
+          done
+          sha256sum -c <<'EOF'
+          78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip
+          c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip
+          EOF
+          for zip in *.zip; do unzip -q "$zip"; done
+          cargo build --locked --release --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+          generator/target/release/generate --seed 41 --events 20000000 --clicks 5000000 --output practice
+          python3 -m venv .venv
+          .venv/bin/pip install -q -r starter-polars/requirements.txt
+
+      - name: Verify fixtures and the updated official dev answer
+        shell: bash
+        run: |
+          cd ci
+          export CPUS=4 MEM=12g PLATFORM=linux/amd64
+          runner=starter-polars/scripts/docker_run.sh
+          IMAGE=shopping-sessions:combined .venv/bin/python starter-polars/scripts/run_fixtures.py starter-polars/fixtures -- sh "$runner"
+          for version in baseline tuned combined; do
+            IMAGE="shopping-sessions:$version" sh "$runner" dev "out-dev-$version"
+            .venv/bin/python starter-polars/scripts/compare.py "out-dev-$version" dev-answer
+          done
+      - name: Compare exact output, time, and peak memory at 20M and 60M
+        shell: bash
+        run: |
+          cd ci
+          mkdir -m 777 bench-scratch
+          input=practice
+          run() {
+            local version="$1" out="$2"
+            shift 2
+            docker run --rm --platform linux/amd64 --network none --read-only \
+              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+              --security-opt no-new-privileges --pids-limit 4096 \
+              --cpus 4 --memory 12g --memory-swap 12g --user 1000:1000 \
+              -v "$PWD/$input":/data:ro -v "$PWD/$out":/output -v "$PWD/bench-scratch":/scratch \
+              -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+              -e NCPU=8 -e MEM_GB=12 "${@}" "shopping-sessions:$version" "${args[@]}"
+          }
+          versions=(baseline tuned combined)
+          args=()
+          for input in practice final-data; do
+            if [[ $input == final-data ]]; then
+              generator/target/release/generate --seed 77 --events 60000000 --clicks 15000000 --output final-data
+            fi
+            for version in "${versions[@]}"; do
+              echo "$input $version memory"
+              mkdir -m 777 "out-$input-$version"
+              args=(-c '/app/run.sh && { printf "Peak cgroup bytes: "; cat /sys/fs/cgroup/memory.peak; printf "CPU quota: "; cat /sys/fs/cgroup/cpu.max; }')
+              run "$version" "out-$input-$version" --entrypoint /bin/sh
+            done
+            args=()
+            for version in tuned combined; do
+              .venv/bin/python starter-polars/scripts/compare.py "out-$input-baseline" "out-$input-$version"
+            done
+            mkdir -m 777 "timed-$input"
+            for round in 0 1 2; do
+              for offset in 0 1 2; do
+                version=${versions[(round+offset)%3]}
+                begin=$(date +%s%N)
+                run "$version" "timed-$input"
+                end=$(date +%s%N)
+                echo "$input $version $((end-begin))" | tee -a timings.txt
+              done
+            done
+          done
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from collections import defaultdict
+          from statistics import median
+          times = defaultdict(list)
+          for row in open("timings.txt"):
+              dataset, version, nanoseconds = row.split()
+              times[dataset, version].append(int(nanoseconds) / 1e9)
+          for dataset in ("practice", "final-data"):
+              base = median(times[dataset, "baseline"])
+              print(f"{dataset} baseline {base:.3f}s")
+              for version in ("tuned", "combined"):
+                  result = median(times[dataset, version])
+                  print(f"{dataset} {version} {result:.3f}s, reduction {1-result/base:.1%}")
+          PY
