@@ -1,10 +1,15 @@
 # Build stage: compile the pipeline for linux/amd64.
-FROM rust:1-slim-bookworm AS build
+# The compiler is pinned to the exact release that recorded pgo/merged.profdata,
+# a profile of the pipeline on generated data, so the profile matches the code.
+FROM rust:1.100.0-slim-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY pgo ./pgo
 ARG PIPELINE_CPU=x86-64-v3
-RUN cargo rustc --release --locked -- -C "target-cpu=${PIPELINE_CPU}" && strip target/release/pipeline
+RUN cargo rustc --release --locked -- -C "target-cpu=${PIPELINE_CPU}" \
+        -C profile-use=/build/pgo/merged.profdata \
+    && strip target/release/pipeline
 
 # Runtime stage: just the binary.
 FROM debian:bookworm-slim

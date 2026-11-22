@@ -69,7 +69,18 @@ No code was reused from before the event.
 The image targets x86-64-v3 for the scorer's Xeon CPUs. Use
 `--build-arg PIPELINE_CPU=x86-64` to build for an older x86-64 host.
 
-Locally, without Docker:
+The build is profile-guided: `pgo/merged.profdata` was recorded by an
+instrumented build of this exact source (`-C profile-generate`) running on
+generated datasets, then merged with `llvm-profdata` 23.1.5. The Dockerfile
+pins `rust:1.100.0-slim-bookworm`, the release that recorded it, so the
+profile matches the compiler. To rebuild the profile after changing the
+source:
+
+    cargo rustc --release -- -C target-cpu=x86-64-v3 -C profile-generate=/tmp/pgo
+    DATA_DIR=dev OUTPUT_DIR=out ./target/release/pipeline   # and larger datasets
+    llvm-profdata merge -o pgo/merged.profdata /tmp/pgo/*.profraw
+
+Locally, without Docker (without the profile, about 5-10% slower):
 
     cargo build --release
     DATA_DIR=dev OUTPUT_DIR=out ./target/release/pipeline
