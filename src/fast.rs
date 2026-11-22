@@ -46,24 +46,143 @@ fn pack<const PREFIX: u8>(id: &[u8]) -> Option<u64> {
 
 /// Bits 56..63 of every name that does not pack into a word. A packed name
 /// can never hold this pattern there, because `pack` refuses a last byte of
-/// 0x7f. The other 57 bits come from a hash of the ID's bytes, and
-/// `LongNames` proves that no two distinct IDs of one run share a name.
+/// 0x7f. The other 57 bits come from a hash of the ID, and `LongNames` proves
+/// that no two distinct IDs of one run share a name.
 const LONG_TAG: u64 = 0x7f << 56;
 const LONG_HASH_BITS: u64 = !(0x7f << 56);
 
 #[inline]
-fn long_name(id: &[u8]) -> u64 {
-    let mut h = rustc_hash::FxBuildHasher.hash_one(id);
-    // Finish the hash so every input byte reaches the bits that are kept.
+fn finish_hash(mut h: u64) -> u64 {
+    // Every input bit reaches every output bit, the kept ones included.
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
     h ^= h >> 33;
     h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    h ^= h >> 33;
-    (h & LONG_HASH_BITS) | LONG_TAG
+    h ^ (h >> 33)
 }
 
-/// The partition of a routed person, and of the bytes behind a long name.
+const ONES: u64 = 0x0101_0101_0101_0101;
+const HIGH: u64 = 0x8080_8080_8080_8080;
+
+/// Per byte of a word of ASCII bytes, 0x80 where the byte lies in lo..=hi.
+#[inline]
+fn in_range(word: u64, lo: u8, hi: u8) -> u64 {
+    let at_least = word.wrapping_add(ONES * (0x80 - lo as u64));
+    let above = word.wrapping_add(ONES * (0x7f - hi as u64));
+    at_least & !above & HIGH
+}
+
+/// Eight hexadecimal digits as one number (the first digit in the lowest
+/// nibble), and whether any of them is a lowercase or an uppercase letter.
+#[inline]
+fn hex_word(word: u64) -> Option<(u64, bool, bool)> {
+    if word & HIGH != 0 {
+        return None;
+    }
+    let digit = in_range(word, b'0', b'9');
+    let lower = in_range(word, b'a', b'f');
+    let upper = in_range(word, b'A', b'F');
+    if digit | lower | upper != HIGH {
+        return None;
+    }
+    let mut nibbles = (word & (ONES * 0x0f)) + ((lower | upper) >> 7) * 9;
+    nibbles = (nibbles | (nibbles >> 4)) & 0x00ff_00ff_00ff_00ff;
+    nibbles = (nibbles | (nibbles >> 8)) & 0x0000_ffff_0000_ffff;
+    nibbles = (nibbles | (nibbles >> 16)) & 0x0000_0000_ffff_ffff;
+    Some((nibbles, lower != 0, upper != 0))
+}
+
+/// An ID made of one prefix byte and 32 hexadecimal digits whose letters
+/// share one case, held losslessly: the digits as 128 bits, the prefix byte
+/// and the case of the letters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct HexId {
+    digits: [u64; 2],
+    prefix: u8,
+    upper: bool,
+}
+
+#[inline]
+fn hex_id(id: &[u8]) -> Option<HexId> {
+    let id: &[u8; 33] = id.try_into().ok()?;
+    let word = |i: usize| u64::from_le_bytes(id[1 + 8 * i..9 + 8 * i].try_into().unwrap());
+    let (a, la, ua) = hex_word(word(0))?;
+    let (b, lb, ub) = hex_word(word(1))?;
+    let (c, lc, uc) = hex_word(word(2))?;
+    let (d, ld, ud) = hex_word(word(3))?;
+    let (lower, upper) = (la | lb | lc | ld, ua | ub | uc | ud);
+    if lower && upper {
+        return None;
+    }
+    Some(HexId { digits: [a | b << 32, c | d << 32], prefix: id[0], upper })
+}
+
+impl HexId {
+    #[inline]
+    fn hash(self) -> u64 {
+        finish_hash(rustc_hash::FxBuildHasher.hash_one(self))
+    }
+
+    fn write(self, out: &mut [u8; 33]) {
+        out[0] = self.prefix;
+        // The distance from '0' + 10 to the first letter of the ID's case.
+        let letter = if self.upper { b'A' - b'0' - 10 } else { b'a' - b'0' - 10 } as u64;
+        for (i, chunk) in out[1..].chunks_exact_mut(8).enumerate() {
+            // Spread eight digits, first digit lowest, one per byte.
+            let mut x = (self.digits[i / 2] >> (32 * (i % 2))) & 0xffff_ffff;
+            x = (x | (x << 16)) & 0x0000_ffff_0000_ffff;
+            x = (x | (x << 8)) & 0x00ff_00ff_00ff_00ff;
+            x = (x | (x << 4)) & 0x0f0f_0f0f_0f0f_0f0f;
+            let letters = ((x + ONES * 6) >> 4) & ONES;
+            let ascii = x + ONES * b'0' as u64 + letters * letter;
+            chunk.copy_from_slice(&ascii.to_le_bytes());
+        }
+    }
+}
+
+/// The exact text behind a long name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LongText {
+    Hex(HexId),
+    Bytes(&'static [u8]),
+}
+
+impl LongText {
+    /// The long name of an ID that does not pack, and its exact text.
+    #[inline]
+    fn of(id: &'static [u8]) -> (u64, Self) {
+        let (hash, text) = match hex_id(id) {
+            Some(hex) => (hex.hash(), Self::Hex(hex)),
+            None => (finish_hash(rustc_hash::FxBuildHasher.hash_one(id)), Self::Bytes(id)),
+        };
+        ((hash & LONG_HASH_BITS) | LONG_TAG, text)
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Self::Hex(_) => 33,
+            Self::Bytes(id) => id.len(),
+        }
+    }
+
+    fn with_bytes<R>(self, f: impl FnOnce(&[u8]) -> R) -> R {
+        match self {
+            Self::Hex(hex) => {
+                let mut text = [0; 33];
+                hex.write(&mut text);
+                f(&text)
+            }
+            Self::Bytes(id) => f(id),
+        }
+    }
+}
+
+#[cfg(test)]
+fn long_name(id: &'static [u8]) -> u64 {
+    LongText::of(id).0
+}
+
+/// The partition of a routed person, and of the text behind a long name.
 #[inline]
 fn person_shard(name: u64) -> usize {
     shard(rustc_hash::FxBuildHasher.hash_one(name))
@@ -72,35 +191,35 @@ fn person_shard(name: u64) -> usize {
 /// Long user IDs seen while parsing, by `person_shard` of their name, so that
 /// `LongNames::verify` can check them shard by shard. A small direct-mapped
 /// memory of the latest pairs skips most repeats of busy IDs; it only skips
-/// a pair that is byte-for-byte the one it remembers.
+/// a pair whose text equals the one it remembers.
 struct LongSink {
-    seen: Vec<(u64, &'static [u8])>,
-    names: [Vec<(u64, &'static [u8])>; SHARDS],
+    seen: Vec<(u64, LongText)>,
+    names: [Vec<(u64, LongText)>; SHARDS],
 }
 
 impl LongSink {
     fn new() -> Self {
         Self {
-            seen: vec![(0, b""); 512],
+            seen: vec![(0, LongText::Bytes(b"")); 512],
             names: std::array::from_fn(|_| Vec::new()),
         }
     }
 
     #[inline]
-    fn push(&mut self, name: u64, id: &'static [u8]) {
+    fn push(&mut self, name: u64, text: LongText) {
         let memo = &mut self.seen[(name as usize ^ (name >> 23) as usize) & 511];
-        if memo.0 == name && memo.1 == id {
+        if memo.0 == name && memo.1 == text {
             return;
         }
-        *memo = (name, id);
-        self.names[person_shard(name)].push((name, id));
+        *memo = (name, text);
+        self.names[person_shard(name)].push((name, text));
     }
 }
 
 /// The text behind every long name of the run.
 struct LongNames {
-    links: FxHashMap<u64, &'static [u8]>,
-    shards: Vec<FxHashMap<u64, &'static [u8]>>,
+    links: FxHashMap<u64, LongText>,
+    shards: Vec<FxHashMap<u64, LongText>>,
 }
 
 static LONG_NAMES: std::sync::OnceLock<LongNames> = std::sync::OnceLock::new();
@@ -108,8 +227,8 @@ static LONG_NAMES: std::sync::OnceLock<LongNames> = std::sync::OnceLock::new();
 impl LongNames {
     /// Merge the names seen in events and clicks with those of the links.
     /// None when two distinct IDs share a name: the exact pipeline runs then.
-    fn verify(links: FxHashMap<u64, &'static [u8]>, sinks: Vec<LongSink>) -> Option<Self> {
-        let mut by_shard: [Vec<Vec<(u64, &'static [u8])>>; SHARDS] = std::array::from_fn(|_| Vec::new());
+    fn verify(links: FxHashMap<u64, LongText>, sinks: Vec<LongSink>) -> Option<Self> {
+        let mut by_shard: [Vec<Vec<(u64, LongText)>>; SHARDS] = std::array::from_fn(|_| Vec::new());
         for sink in sinks {
             for (shard, names) in by_shard.iter_mut().zip(sink.names) {
                 if !names.is_empty() {
@@ -120,23 +239,16 @@ impl LongNames {
         let shards = by_shard
             .into_par_iter()
             .map(|lists| {
-                let mut map: FxHashMap<u64, &'static [u8]> = FxHashMap::default();
-                for (name, id) in lists.into_iter().flatten() {
+                let mut map: FxHashMap<u64, LongText> = FxHashMap::default();
+                for (name, text) in lists.into_iter().flatten() {
                     if let Some(&known) = links.get(&name) {
-                        if known != id {
+                        if known != text {
                             return None;
                         }
                         continue;
                     }
-                    match map.entry(name) {
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            entry.insert(id);
-                        }
-                        std::collections::hash_map::Entry::Occupied(entry) => {
-                            if *entry.get() != id {
-                                return None;
-                            }
-                        }
+                    if *map.entry(name).or_insert(text) != text {
+                        return None;
                     }
                 }
                 Some(map)
@@ -145,10 +257,10 @@ impl LongNames {
         Some(Self { links, shards })
     }
 
-    fn bytes(name: u64) -> &'static [u8] {
+    fn text(name: u64) -> LongText {
         let names = LONG_NAMES.get().expect("long names are verified before output");
         match names.links.get(&name) {
-            Some(&id) => id,
+            Some(&text) => text,
             None => names.shards[person_shard(name)][&name],
         }
     }
@@ -161,48 +273,54 @@ impl PackedName {
     }
 
     /// The name of a user ID. Short IDs pack into the word itself; any other
-    /// ID gets a long name, and its bytes go to `sink` for verification.
+    /// ID gets a long name, and its text goes to `sink` for verification.
     #[inline]
     fn of(id: &'static [u8], sink: &mut LongSink) -> Self {
         match pack::<b'u'>(id) {
             Some(value) => Self(value),
-            None => {
-                let name = long_name(id);
-                sink.push(name, id);
-                Self(name)
-            }
+            None => Self::long(id, sink),
         }
+    }
+
+    /// Kept out of line so the parsing loops stay small for packed IDs.
+    #[inline(never)]
+    fn long(id: &'static [u8], sink: &mut LongSink) -> Self {
+        let (name, text) = LongText::of(id);
+        sink.push(name, text);
+        Self(name)
     }
 
     fn text_len(self) -> usize {
         if self.is_long() {
-            return LongNames::bytes(self.0).len();
+            return LongNames::text(self.0).len();
         }
         let suffix = self.0 & !UPPER_CASE;
         1 + ((64 - suffix.leading_zeros()) as usize).div_ceil(8)
     }
 
     /// The ID's bytes; `long` holds the text of long names.
-    fn text<'a>(
-        self,
-        long: &FxHashMap<u64, &'static [u8]>,
-        buffer: &'a mut [u8; 9],
-    ) -> &'a [u8] {
+    fn text<'a>(self, long: &FxHashMap<u64, LongText>, buffer: &'a mut [u8; 33]) -> &'a [u8] {
         if self.is_long() {
-            return long[&self.0];
+            return match long[&self.0] {
+                LongText::Hex(hex) => {
+                    hex.write(buffer);
+                    &buffer[..]
+                }
+                LongText::Bytes(id) => id,
+            };
         }
         let len = self.text_len();
         buffer[0] = if self.0 & UPPER_CASE == 0 { b'u' } else { b'U' };
-        buffer[1..].copy_from_slice(&(self.0 & !UPPER_CASE).to_le_bytes());
+        buffer[1..9].copy_from_slice(&(self.0 & !UPPER_CASE).to_le_bytes());
         &buffer[..len]
     }
 
     /// Byte-wise order of the two IDs behind these names.
-    fn precedes(self, other: Self, long: &FxHashMap<u64, &'static [u8]>) -> bool {
+    fn precedes(self, other: Self, long: &FxHashMap<u64, LongText>) -> bool {
         if !self.is_long() && !other.is_long() {
             return self.byte_order() < other.byte_order();
         }
-        let (mut a, mut b) = ([0; 9], [0; 9]);
+        let (mut a, mut b) = ([0; 33], [0; 33]);
         self.text(long, &mut a) < other.text(long, &mut b)
     }
 
@@ -221,8 +339,9 @@ impl OutputName for PackedName {
         let mut text = [0; 9];
         for packed in names {
             if packed.is_long() {
-                let id = LongNames::bytes(packed.0);
-                builder.append_value(std::str::from_utf8(id).expect("UTF-8 user ID"));
+                LongNames::text(packed.0).with_bytes(|id| {
+                    builder.append_value(std::str::from_utf8(id).expect("UTF-8 user ID"))
+                });
                 continue;
             }
             let Self(name) = packed;
@@ -244,7 +363,7 @@ impl OutputName for PackedName {
         let mut table = crate::plain_parquet::UserTable::new(rows.names.len());
         table.names(&rows.names, Self::text_len, |name, bytes| {
             if name.is_long() {
-                bytes.extend_from_slice(LongNames::bytes(name.0));
+                LongNames::text(name.0).with_bytes(|id| bytes.extend_from_slice(id));
                 return;
             }
             let suffix = (name.0 & !UPPER_CASE).to_le_bytes();
@@ -345,19 +464,19 @@ impl PackedLinks {
 
     /// The link table and the text of every long name in the links. None
     /// when two distinct linked IDs share a long name.
-    pub(super) fn build(
+    fn build(
         buffers: &[&'static [u8]],
-    ) -> Option<(Self, FxHashMap<u64, &'static [u8]>)> {
+    ) -> Option<(Self, FxHashMap<u64, LongText>)> {
         let (parts, long_parts): (Vec<_>, Vec<_>) = chunks(buffers)
             .into_par_iter()
             .map(|chunk| {
                 let mut pairs = Vec::new();
-                let mut long: Vec<(u64, &'static [u8])> = Vec::new();
+                let mut long: Vec<(u64, LongText)> = Vec::new();
                 let mut name = |id: &'static [u8]| match pack::<b'u'>(id) {
                     Some(value) => PackedName(value),
                     None => {
-                        let name = long_name(id);
-                        long.push((name, id));
+                        let (name, text) = LongText::of(id);
+                        long.push((name, text));
                         PackedName(name)
                     }
                 };
@@ -371,9 +490,9 @@ impl PackedLinks {
                 (pairs, long)
             })
             .unzip();
-        let mut long_names: FxHashMap<u64, &'static [u8]> = FxHashMap::default();
-        for (name, id) in long_parts.into_iter().flatten() {
-            if *long_names.entry(name).or_insert(id) != id {
+        let mut long_names: FxHashMap<u64, LongText> = FxHashMap::default();
+        for (name, text) in long_parts.into_iter().flatten() {
+            if *long_names.entry(name).or_insert(text) != text {
                 return None;
             }
         }
@@ -446,13 +565,28 @@ struct Candidate {
     event: SmallEvent,
 }
 
-/// An event whose ID does not pack into a word. It is deduplicated by its
-/// exact bytes.
+/// An event whose ID is a prefix and 32 hex digits, deduplicated on the
+/// lossless value of the ID.
+#[derive(Clone, Copy)]
+struct HexCandidate {
+    id: HexId,
+    ingest: i64,
+    event: SmallEvent,
+}
+
+/// An event with any other ID that does not pack, deduplicated on its bytes.
 #[derive(Clone, Copy)]
 struct LongCandidate {
     id: &'static [u8],
     ingest: i64,
     event: SmallEvent,
+}
+
+/// One partition's events whose IDs do not pack into a word.
+#[derive(Default)]
+struct WideCandidates {
+    hex: Vec<Vec<HexCandidate>>,
+    bytes: Vec<Vec<LongCandidate>>,
 }
 
 #[inline]
@@ -481,7 +615,7 @@ fn mark(words: &mut [u64], index: usize) -> bool {
 
 fn route_partition(
     pieces: Vec<Vec<Candidate>>,
-    long: Vec<Vec<LongCandidate>>,
+    wide: WideCandidates,
     words: usize,
     links: &PackedLinks,
 ) -> Buckets<SmallEvent> {
@@ -500,7 +634,9 @@ fn route_partition(
     drop(seen);
 
     let total: usize = pieces.iter().map(Vec::len).sum();
-    let routed = total + long.iter().map(Vec::len).sum::<usize>();
+    let hex_total: usize = wide.hex.iter().map(Vec::len).sum();
+    let bytes_total: usize = wide.bytes.iter().map(Vec::len).sum();
+    let routed = total + hex_total + bytes_total;
     let mut buckets: Buckets<SmallEvent> =
         std::array::from_fn(|_| Vec::with_capacity(routed / SHARDS * 5 / 4 + 64));
     // Contested slots are a few percent of the partition; size for them up
@@ -539,11 +675,48 @@ fn route_partition(
     }
     drop(pieces);
 
-    // IDs that do not pack are deduplicated on their exact bytes.
-    let long_total: usize = long.iter().map(Vec::len).sum();
+    // Hex IDs: the same slot marking, then exact selection on the lossless
+    // value of the ID for contested slots.
+    if hex_total > 0 {
+        let slots = (hex_total * 8).next_power_of_two().max(64);
+        let mask = slots - 1;
+        let mut seen = vec![0u64; slots / 64];
+        let mut repeated = vec![0u64; slots / 64];
+        for candidate in wide.hex.iter().flatten() {
+            let slot = candidate.id.hash() as usize & mask;
+            if mark(&mut seen, slot) {
+                mark(&mut repeated, slot);
+            }
+        }
+        drop(seen);
+        let mut contested: FxHashMap<HexId, (i64, SmallEvent)> = FxHashMap::default();
+        for candidate in wide.hex.iter().flatten() {
+            let slot = candidate.id.hash() as usize & mask;
+            if repeated[slot / 64] & (1u64 << (slot % 64)) == 0 {
+                route(candidate.event, links, &mut buckets);
+                continue;
+            }
+            let value = (candidate.ingest, candidate.event);
+            match contested.entry(candidate.id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(value);
+                }
+                Entry::Occupied(mut entry) => {
+                    if candidate.ingest < entry.get().0 {
+                        entry.insert(value);
+                    }
+                }
+            }
+        }
+        for (_, event) in contested.into_values() {
+            route(event, links, &mut buckets);
+        }
+    }
+
+    // Any other ID that does not pack is deduplicated on its exact bytes.
     let mut long_winners: FxHashMap<&'static [u8], (i64, SmallEvent)> =
-        FxHashMap::with_capacity_and_hasher(long_total, Default::default());
-    for candidate in long.iter().flatten() {
+        FxHashMap::with_capacity_and_hasher(bytes_total, Default::default());
+    for candidate in wide.bytes.iter().flatten() {
         let value = (candidate.ingest, candidate.event);
         match long_winners.entry(candidate.id) {
             Entry::Vacant(entry) => {
@@ -580,6 +753,7 @@ const BLOCK: usize = 4096;
 struct Blocks {
     current: [Vec<Candidate>; SHARDS],
     full: [Vec<Vec<Candidate>>; SHARDS],
+    hex: [Vec<HexCandidate>; SHARDS],
     long: [Vec<LongCandidate>; SHARDS],
     sink: LongSink,
 }
@@ -589,6 +763,7 @@ impl Blocks {
         Self {
             current: std::array::from_fn(|_| Vec::with_capacity(BLOCK)),
             full: std::array::from_fn(|_| Vec::new()),
+            hex: std::array::from_fn(|_| Vec::new()),
             long: std::array::from_fn(|_| Vec::new()),
             sink: LongSink::new(),
         }
@@ -604,23 +779,46 @@ impl Blocks {
         }
     }
 
-    fn finish(mut self) -> ([Vec<Vec<Candidate>>; SHARDS], [Vec<LongCandidate>; SHARDS], LongSink) {
+    #[allow(clippy::type_complexity)]
+    /// An event whose ID does not pack. Kept out of line so the parsing loop
+    /// stays small for packed IDs.
+    #[inline(never)]
+    fn push_wide(&mut self, id: &'static [u8], ingest: i64, event: SmallEvent) {
+        match hex_id(id) {
+            Some(id) => {
+                self.hex[shard(id.hash())].push(HexCandidate { id, ingest, event });
+            }
+            None => {
+                let partition = shard(rustc_hash::FxBuildHasher.hash_one(id));
+                self.long[partition].push(LongCandidate { id, ingest, event });
+            }
+        }
+    }
+
+    fn finish(
+        mut self,
+    ) -> (
+        [Vec<Vec<Candidate>>; SHARDS],
+        [Vec<HexCandidate>; SHARDS],
+        [Vec<LongCandidate>; SHARDS],
+        LongSink,
+    ) {
         for (full, current) in self.full.iter_mut().zip(self.current) {
             if !current.is_empty() {
                 full.push(current);
             }
         }
-        (self.full, self.long, self.sink)
+        (self.full, self.hex, self.long, self.sink)
     }
 }
 
-type LongPartitions = [Vec<Vec<LongCandidate>>; SHARDS];
+type WidePartitions = [WideCandidates; SHARDS];
 
 fn collect_candidates(
     buffers: &[&'static [u8]],
     window: &Window,
     catalogs: &Catalogs,
-) -> Option<(CandidatePartitions, LongPartitions, usize, Vec<LongSink>)> {
+) -> Option<(CandidatePartitions, WidePartitions, usize, Vec<LongSink>)> {
     let chunks = chunks(buffers);
     let bytes = chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
     let slots = (bytes / 16)
@@ -665,10 +863,7 @@ fn collect_candidates(
                             let key = event_key(id);
                             possible.push(shard(key), Candidate { key, ingest, event });
                         }
-                        None => {
-                            let partition = shard(rustc_hash::FxBuildHasher.hash_one(id));
-                            possible.long[partition].push(LongCandidate { id, ingest, event });
-                        }
+                        None => possible.push_wide(id, ingest, event),
                     }
                     true
                 });
@@ -678,21 +873,24 @@ fn collect_candidates(
         .collect::<Option<Vec<_>>>()?;
 
     let mut partitions: CandidatePartitions = std::array::from_fn(|_| Vec::new());
-    let mut long_partitions: LongPartitions = std::array::from_fn(|_| Vec::new());
+    let mut wide: WidePartitions = std::array::from_fn(|_| WideCandidates::default());
     let mut sinks = Vec::with_capacity(pieces.len());
     for piece in pieces {
-        let (blocks, long, sink) = piece.finish();
+        let (blocks, hex, long, sink) = piece.finish();
         for (partition, blocks) in partitions.iter_mut().zip(blocks) {
             partition.extend(blocks);
         }
-        for (partition, long) in long_partitions.iter_mut().zip(long) {
+        for ((partition, hex), long) in wide.iter_mut().zip(hex).zip(long) {
+            if !hex.is_empty() {
+                partition.hex.push(hex);
+            }
             if !long.is_empty() {
-                partition.push(long);
+                partition.bytes.push(long);
             }
         }
         sinks.push(sink);
     }
-    Some((partitions, long_partitions, slots / SHARDS / 64, sinks))
+    Some((partitions, wide, slots / SHARDS / 64, sinks))
 }
 
 #[inline]
@@ -967,15 +1165,15 @@ pub(super) fn try_pipeline(
         },
     );
     crate::lap("parse joined");
-    let (candidates, long_candidates, words, mut sinks) = candidates?;
+    let (candidates, wide_candidates, words, mut sinks) = candidates?;
     let (links, long_links, clicks, click_sinks) = linked_clicks?;
     sinks.extend(click_sinks);
     let (routed, long_names) = rayon::join(
         || {
             candidates
                 .into_par_iter()
-                .zip(long_candidates)
-                .map(|(pieces, long)| route_partition(pieces, long, words, &links))
+                .zip(wide_candidates)
+                .map(|(pieces, wide)| route_partition(pieces, wide, words, &links))
                 .collect()
         },
         || LongNames::verify(long_links, sinks),
@@ -1019,8 +1217,8 @@ mod tests {
                 .unwrap();
         let external = long_name(b"external");
         assert_eq!(long.len(), 2);
-        assert_eq!(long[&external], b"external");
-        assert_eq!(long[&long_name(hex)], hex);
+        assert_eq!(long[&external], LongText::Bytes(b"external"));
+        assert_eq!(long[&long_name(hex)], LongText::Hex(hex_id(hex).unwrap()));
         for alias in [PackedName(name(b"ua")), PackedName(long_name(hex)), PackedName(external)] {
             assert_eq!(links.canonical(alias).0, external);
         }
@@ -1029,6 +1227,42 @@ mod tests {
         let (links, _) = PackedLinks::build(&[b"a,b\nu1,u0123456789abcdef0123456789abcdef\n"]).unwrap();
         assert_eq!(links.canonical(PackedName(name(b"u1"))).0, long_name(hex));
         assert_eq!(links.canonical(PackedName(long_name(hex))).0, long_name(hex));
+    }
+
+    #[test]
+    fn hex_ids_round_trip_exactly() {
+        for id in [
+            &b"u0123456789abcdef0123456789abcdef"[..],
+            b"UFEDCBA9876543210FEDCBA9876543210",
+            b"k00000000000000000000000000000000",
+            b"e99999999999999999999999999999999",
+            b"xffffffffffffffffffffffffffffffff",
+        ] {
+            let hex = hex_id(id).unwrap();
+            let mut text = [0; 33];
+            hex.write(&mut text);
+            assert_eq!(&text[..], id);
+        }
+        for id in [
+            &b"u0123456789abcdef0123456789abcdeF"[..],
+            b"u0123456789abcdef0123456789abcdeg",
+            b"u0123456789abcdef0123456789abcde",
+            b"u0123456789abcdef0123456789abcdef0",
+            b"u0123456789abcdef0123456789abcde/",
+            b"u0123456789abcdef0123456789abcde:",
+            b"u0123456789abcdef0123456789abcde`",
+            b"u0123456789abcdef0123456789abcde@",
+            b"u0123456789abcdef0123456789abcde\xc3",
+        ] {
+            assert!(hex_id(id).is_none(), "{:?}", std::str::from_utf8(id));
+        }
+        // Different texts never share a value.
+        let a = hex_id(b"u0123456789abcdef0123456789abcdef").unwrap();
+        let b = hex_id(b"U0123456789ABCDEF0123456789ABCDEF").unwrap();
+        let c = hex_id(b"U0123456789abcdef0123456789abcdef").unwrap();
+        assert!(a != b && a != c && b != c);
+        assert_eq!(hex_id(b"u10000000000000000000000000000000").unwrap().digits, [1, 0]);
+        assert_eq!(hex_id(b"u00000000000000000000000000000001").unwrap().digits, [0, 1 << 60]);
     }
 
     #[test]
@@ -1073,12 +1307,28 @@ mod tests {
             ],
             vec![long_candidate(b"e0123456789abcdef0123456789abcdef", 10, CompactFact(800))],
         ];
-        let mut facts: Vec<_> = route_partition(pieces, long, 1, &links)
+        let hex_candidate = |id: &[u8], ingest, fact| HexCandidate {
+            id: hex_id(id).unwrap(),
+            ingest,
+            event: SmallEvent { person: PackedName(11), fact },
+        };
+        let hex = vec![
+            vec![
+                hex_candidate(b"e0000000000000000000000000000000a", 5, CompactFact(900)),
+                hex_candidate(b"e000000000000000000000000000000b0", 5, CompactFact(910)),
+            ],
+            vec![
+                hex_candidate(b"e0000000000000000000000000000000a", 4, CompactFact(920)),
+                hex_candidate(b"E0000000000000000000000000000000A", 9, CompactFact(930)),
+            ],
+        ];
+        let wide = WideCandidates { hex, bytes: long };
+        let mut facts: Vec<_> = route_partition(pieces, wide, 1, &links)
             .into_iter()
             .flatten()
             .map(|event| event.fact.0)
             .collect();
         facts.sort_unstable();
-        assert_eq!(facts, [300, 400, 500, 700, 800]);
+        assert_eq!(facts, [300, 400, 500, 700, 800, 910, 920, 930]);
     }
 }

@@ -24,15 +24,16 @@ cost: the clock runs from container start to container exit.
    offset, F3 epoch millis), with full calendar validation including leap years.
    An F3 value too large for `i64` is treated as valid but outside the window.
 4. **Dedup** events with exact ID comparisons. IDs are opaque variable-width
-   strings. A short ID is packed losslessly into one machine word; any other
-   ID (such as a 32-character hex one) is deduplicated on its exact bytes. For
+   strings. A short ID is packed losslessly into one machine word, an ID of
+   one prefix byte and 32 hex digits is decoded losslessly into 128 bits, and
+   any other ID is deduplicated on its exact bytes. For
    packed IDs the compact path first marks contested hash slots in
    cache-sized partitions, sends uncontested events directly to their person,
    and uses exact earliest-ingest selection for contested slots, including
    invalid candidates.
 5. **Link** user IDs with union-find. A user ID that does not pack gets a
-   word-sized name from a hash of its bytes; every such name is checked
-   against the exact bytes of every ID that produced it, and the run falls
+   word-sized name from a hash of its text; every such name is checked
+   against the exact text of every ID that produced it, and the run falls
    back to a full byte-string pipeline if two distinct IDs ever share one.
    Each person is named by the byte-wise smallest ID in their component,
    stored in a flat open-addressed table, kept at most about 40% full so a
