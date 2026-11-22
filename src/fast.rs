@@ -686,9 +686,10 @@ fn route_partition(
     let routed = total + hex_total + bytes_total;
     let mut buckets: Buckets<SmallEvent> =
         std::array::from_fn(|_| Vec::with_capacity(routed / SHARDS * 5 / 4 + 64));
-    // Contested slots are a few percent of the partition; size for them up
-    // front instead of rehashing as the map grows.
-    let mut winners = FxHashMap::with_capacity_and_hasher(total / 8 + 64, Default::default());
+    // About a fifth of a partition's events land in contested slots, and
+    // two thirds of those are distinct IDs; size for them up front instead
+    // of rehashing as the map grows.
+    let mut winners = FxHashMap::with_capacity_and_hasher(total / 5 + 64, Default::default());
     const AHEAD: usize = 32;
     for piece in &pieces {
         let (keys, ingests, events) = (&piece.keys[..], &piece.ingests[..], &piece.events[..]);
@@ -718,10 +719,10 @@ fn route_partition(
             }
         }
     }
-    for (_, event) in winners.into_values() {
-        route(event, links, &mut buckets);
-    }
     drop(pieces);
+    let winners: Vec<SmallEvent> = winners.into_values().map(|(_, event)| event).collect();
+    route_all(&winners, links, &mut buckets);
+    drop(winners);
 
     // Hex IDs: the same slot marking, then exact selection on the lossless
     // value of the ID for contested slots.
@@ -737,28 +738,38 @@ fn route_partition(
             }
         }
         drop(seen);
-        let mut contested: FxHashMap<HexId, (i64, SmallEvent)> = FxHashMap::default();
-        for candidate in wide.hex.iter().flatten() {
-            let slot = candidate.id.hash() as usize & mask;
-            if repeated[slot / 64] & (1u64 << (slot % 64)) == 0 {
-                route(candidate.event, links, &mut buckets);
-                continue;
-            }
-            let value = (candidate.ingest, candidate.event);
-            match contested.entry(candidate.id) {
-                Entry::Vacant(entry) => {
-                    entry.insert(value);
+        let mut contested: FxHashMap<HexId, (i64, SmallEvent)> =
+            FxHashMap::with_capacity_and_hasher(hex_total / 4 + 16, Default::default());
+        for part in &wide.hex {
+            for index in 0..part.len() {
+                // The person's link slot 32 rows ahead is fetched while this
+                // row is routed, as for packed IDs.
+                if let Some(ahead) = part.get(index + AHEAD) {
+                    if ahead.event.fact.valid() {
+                        links.prefetch(ahead.event.person);
+                    }
                 }
-                Entry::Occupied(mut entry) => {
-                    if candidate.ingest < entry.get().0 {
+                let candidate = &part[index];
+                let slot = candidate.id.hash() as usize & mask;
+                if repeated[slot / 64] & (1u64 << (slot % 64)) == 0 {
+                    route(candidate.event, links, &mut buckets);
+                    continue;
+                }
+                let value = (candidate.ingest, candidate.event);
+                match contested.entry(candidate.id) {
+                    Entry::Vacant(entry) => {
                         entry.insert(value);
+                    }
+                    Entry::Occupied(mut entry) => {
+                        if candidate.ingest < entry.get().0 {
+                            entry.insert(value);
+                        }
                     }
                 }
             }
         }
-        for (_, event) in contested.into_values() {
-            route(event, links, &mut buckets);
-        }
+        let contested: Vec<SmallEvent> = contested.into_values().map(|(_, event)| event).collect();
+        route_all(&contested, links, &mut buckets);
     }
 
     // Any other ID that does not pack is deduplicated on its exact bytes.
@@ -777,10 +788,22 @@ fn route_partition(
             }
         }
     }
-    for (_, event) in long_winners.into_values() {
-        route(event, links, &mut buckets);
-    }
+    let long_winners: Vec<SmallEvent> = long_winners.into_values().map(|(_, event)| event).collect();
+    route_all(&long_winners, links, &mut buckets);
     buckets
+}
+
+/// Routes dedup winners, fetching the link slot 32 rows ahead.
+fn route_all(events: &[SmallEvent], links: &PackedLinks, buckets: &mut Buckets<SmallEvent>) {
+    const AHEAD: usize = 32;
+    for index in 0..events.len() {
+        if let Some(ahead) = events.get(index + AHEAD) {
+            if ahead.fact.valid() {
+                links.prefetch(ahead.person);
+            }
+        }
+        route(events[index], links, buckets);
+    }
 }
 
 type CandidatePartitions = [Vec<Piece>; SHARDS];
@@ -790,11 +813,14 @@ type CandidatePartitions = [Vec<Piece>; SHARDS];
 /// is wasted. With huge pages, a generously pre-sized bucket would instead be
 /// faulted in (and zeroed by the kernel) far beyond what it ever holds.
 const BLOCK: usize = 4096;
+/// Candidates per block of events with hex IDs, which are an eighth of all.
+const HEX_BLOCK: usize = 1024;
 
 struct Blocks {
     current: [Piece; SHARDS],
     full: [Vec<Piece>; SHARDS],
     hex: [Vec<HexCandidate>; SHARDS],
+    hex_full: [Vec<Vec<HexCandidate>>; SHARDS],
     long: [Vec<LongCandidate>; SHARDS],
     sink: LongSink,
 }
@@ -804,7 +830,8 @@ impl Blocks {
         Self {
             current: std::array::from_fn(|_| Piece::with_capacity(BLOCK)),
             full: std::array::from_fn(|_| Vec::new()),
-            hex: std::array::from_fn(|_| Vec::new()),
+            hex: std::array::from_fn(|_| Vec::with_capacity(HEX_BLOCK)),
+            hex_full: std::array::from_fn(|_| Vec::new()),
             long: std::array::from_fn(|_| Vec::new()),
             sink: LongSink::new(),
         }
@@ -827,7 +854,13 @@ impl Blocks {
     fn push_wide(&mut self, id: &'static [u8], ingest: i64, event: SmallEvent) {
         match hex_id(id) {
             Some(id) => {
-                self.hex[shard(id.hash())].push(HexCandidate { id, ingest, event });
+                let partition = shard(id.hash());
+                let current = &mut self.hex[partition];
+                current.push(HexCandidate { id, ingest, event });
+                if current.len() == HEX_BLOCK {
+                    let block = std::mem::replace(current, Vec::with_capacity(HEX_BLOCK));
+                    self.hex_full[partition].push(block);
+                }
             }
             None => {
                 let partition = shard(rustc_hash::FxBuildHasher.hash_one(id));
@@ -840,7 +873,7 @@ impl Blocks {
         mut self,
     ) -> (
         [Vec<Piece>; SHARDS],
-        [Vec<HexCandidate>; SHARDS],
+        [Vec<Vec<HexCandidate>>; SHARDS],
         [Vec<LongCandidate>; SHARDS],
         LongSink,
     ) {
@@ -849,7 +882,12 @@ impl Blocks {
                 full.push(current);
             }
         }
-        (self.full, self.hex, self.long, self.sink)
+        for (full, current) in self.hex_full.iter_mut().zip(self.hex) {
+            if !current.is_empty() {
+                full.push(current);
+            }
+        }
+        (self.full, self.hex_full, self.long, self.sink)
     }
 }
 
@@ -913,9 +951,7 @@ fn collect_candidates(
             partition.extend(blocks);
         }
         for ((partition, hex), long) in wide.iter_mut().zip(hex).zip(long) {
-            if !hex.is_empty() {
-                partition.hex.push(hex);
-            }
+            partition.hex.extend(hex);
             if !long.is_empty() {
                 partition.bytes.push(long);
             }
