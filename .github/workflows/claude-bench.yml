@@ -99,11 +99,11 @@ jobs:
           # Stage timings inside the container, 4 pinned CPUs and 4 workers.
           for sha in "${SHAS[@]}"; do
             for i in 1 2 3; do
-              rm -rf stage-out; mkdir -m 777 stage-out
+              mkdir -m 777 "stage-out-$sha-$i"
               docker run --rm --platform linux/amd64 --network none --read-only \
                 --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges \
                 --pids-limit 4096 --cpuset-cpus 0-3 --memory 14g --memory-swap 14g --user 1000:1000 \
-                -v "$PWD/practice":/data:ro -v "$PWD/stage-out":/output -v "$PWD/scratch":/scratch \
+                -v "$PWD/practice":/data:ro -v "$PWD/stage-out-$sha-$i":/output -v "$PWD/scratch":/scratch \
                 -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
                 -e NCPU=4 -e MEM_GB=14 -e TIMING=1 "ss:$sha" 2> stages.txt || true
               sed "s/^/STAGES ${sha:0:7} run$i /" stages.txt >> "$out"
