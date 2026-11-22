@@ -1213,16 +1213,16 @@ fn run_pipeline<F: Fact>(data: &Path, outdir: &Path, window: &Window, catalogs: 
     write_results(outdir, catalogs, parts);
 }
 
-/// Aggregate and write the parts heaviest first. Each worker takes the next
-/// part from a shared queue, so the few heavy parts (those holding the very
-/// active people) start early instead of finishing last on one thread.
+/// Aggregate and write the parts heaviest first. Every part is its own job,
+/// started in the given order (FIFO), so the few heavy parts (those holding
+/// the most active people) start early instead of finishing last on one
+/// thread, and a worker that steals a job while waiting runs just one part.
 fn write_results_scheduled<N: OutputName, T: Send>(
     outdir: &Path,
     catalogs: &Catalogs,
     parts: Vec<(usize, T)>,
     aggregate: impl Fn(T) -> (UserRows<N>, CampaignTable) + Sync,
 ) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     let user_dir = outdir.join("user_daily");
     let campaign_dir = outdir.join("campaign_daily");
@@ -1230,20 +1230,11 @@ fn write_results_scheduled<N: OutputName, T: Send>(
     fs::create_dir_all(&campaign_dir).expect("create campaign_daily");
 
     let schema = user_schema();
-    let queue: Vec<Mutex<Option<(usize, T)>>> =
-        parts.into_iter().map(|part| Mutex::new(Some(part))).collect();
-    let next = AtomicUsize::new(0);
-    let totals = (0..rayon::current_num_threads())
-        .into_par_iter()
-        .with_max_len(1)
-        .filter_map(|_| {
-            let mut totals: Option<CampaignTable> = None;
-            loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some(slot) = queue.get(index) else {
-                    return totals;
-                };
-                let (part, input) = slot.lock().unwrap().take().expect("each part is taken once");
+    let totals: Mutex<Option<CampaignTable>> = Mutex::new(None);
+    rayon::scope_fifo(|scope| {
+        for (part, input) in parts {
+            let (user_dir, schema, totals, aggregate) = (&user_dir, &schema, &totals, &aggregate);
+            scope.spawn_fifo(move |_| {
                 let (rows, partial) = aggregate(input);
                 let path = user_dir.join(format!("part-{part}.parquet"));
                 if part == 0 || !rows.names.is_empty() {
@@ -1251,20 +1242,15 @@ fn write_results_scheduled<N: OutputName, T: Send>(
                 } else if path.is_file() {
                     fs::remove_file(path).expect("remove empty user partition from previous run");
                 }
-                totals = Some(match totals {
-                    Some(mut totals) => {
-                        totals.merge(partial);
-                        totals
-                    }
-                    None => partial,
-                });
-            }
-        })
-        .reduce_with(|mut totals, partial| {
-            totals.merge(partial);
-            totals
-        })
-        .expect("at least one aggregation shard");
+                let mut totals = totals.lock().unwrap();
+                match totals.as_mut() {
+                    Some(totals) => totals.merge(partial),
+                    None => *totals = Some(partial),
+                }
+            });
+        }
+    });
+    let totals = totals.into_inner().unwrap().expect("at least one aggregation shard");
     lap("aggregate + user parquet");
     write_campaign_rows(
         &campaign_dir.join("part-0.parquet"),
