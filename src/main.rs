@@ -1213,6 +1213,68 @@ fn run_pipeline<F: Fact>(data: &Path, outdir: &Path, window: &Window, catalogs: 
     write_results(outdir, catalogs, parts);
 }
 
+/// Aggregate and write the parts heaviest first. Each worker takes the next
+/// part from a shared queue, so the few heavy parts (those holding the very
+/// active people) start early instead of finishing last on one thread.
+fn write_results_scheduled<N: OutputName, T: Send>(
+    outdir: &Path,
+    catalogs: &Catalogs,
+    parts: Vec<(usize, T)>,
+    aggregate: impl Fn(T) -> (UserRows<N>, CampaignTable) + Sync,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let user_dir = outdir.join("user_daily");
+    let campaign_dir = outdir.join("campaign_daily");
+    fs::create_dir_all(&user_dir).expect("create user_daily");
+    fs::create_dir_all(&campaign_dir).expect("create campaign_daily");
+
+    let schema = user_schema();
+    let queue: Vec<Mutex<Option<(usize, T)>>> =
+        parts.into_iter().map(|part| Mutex::new(Some(part))).collect();
+    let next = AtomicUsize::new(0);
+    let totals = (0..rayon::current_num_threads())
+        .into_par_iter()
+        .with_max_len(1)
+        .filter_map(|_| {
+            let mut totals: Option<CampaignTable> = None;
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(slot) = queue.get(index) else {
+                    return totals;
+                };
+                let (part, input) = slot.lock().unwrap().take().expect("each part is taken once");
+                let (rows, partial) = aggregate(input);
+                let path = user_dir.join(format!("part-{part}.parquet"));
+                if part == 0 || !rows.names.is_empty() {
+                    write_user_rows(&path, rows, schema.clone());
+                } else if path.is_file() {
+                    fs::remove_file(path).expect("remove empty user partition from previous run");
+                }
+                totals = Some(match totals {
+                    Some(mut totals) => {
+                        totals.merge(partial);
+                        totals
+                    }
+                    None => partial,
+                });
+            }
+        })
+        .reduce_with(|mut totals, partial| {
+            totals.merge(partial);
+            totals
+        })
+        .expect("at least one aggregation shard");
+    lap("aggregate + user parquet");
+    write_campaign_rows(
+        &campaign_dir.join("part-0.parquet"),
+        totals.into_rows(),
+        &catalogs.campaigns,
+        &catalogs.channels,
+    );
+    lap("campaign parquet");
+}
+
 fn write_results<N: OutputName>(
     outdir: &Path,
     catalogs: &Catalogs,

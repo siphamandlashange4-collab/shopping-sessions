@@ -3,7 +3,7 @@
 
 use super::{
     attribution::{CampaignTable, Click}, Lookup,
-    chunks, csv, event_fact, exchange, find_root, shard, summarize, ts, write_results,
+    chunks, csv, event_fact, exchange, find_root, shard, summarize, ts,
     Buckets, Catalogs, CompactFact, Fact, OutputName, UserRows, Window, BAD_TS, ORGANIC,
     SEVEN_DAYS_MS, SHARDS,
 };
@@ -1116,19 +1116,17 @@ fn aggregate_small(
     }
     drop(parts);
 
-    let clicks = clicks
-        .into_iter()
-        .flatten()
-        .filter_map(|click| {
-            Some(Click {
-                user: ids.get(click.person.0)? as u32,
-                time: window.start + i64::from(click.offset_ms),
-                campaign: click.campaign,
-                id: click.id,
-                order: click.order,
-            })
+    let mut grouped = Vec::with_capacity(clicks.iter().map(Vec::len).sum());
+    grouped.extend(clicks.into_iter().flatten().filter_map(|click| {
+        Some(Click {
+            user: ids.get(click.person.0)? as u32,
+            time: window.start + i64::from(click.offset_ms),
+            campaign: click.campaign,
+            id: click.id,
+            order: click.order,
         })
-        .collect();
+    }));
+    let clicks = grouped;
     summarize(
         events,
         offsets,
@@ -1184,11 +1182,16 @@ pub(super) fn try_pipeline(
         return None;
     }
     crate::lap("dedup + route");
-    let parts = exchange(routed)
-        .into_par_iter()
-        .zip(clicks)
-        .map(|(events, clicks)| aggregate_small(events, clicks, window, catalogs));
-    write_results(outdir, catalogs, parts);
+    let mut parts: Vec<_> = exchange(routed).into_iter().zip(clicks).enumerate().collect();
+    // Heaviest first: the shards holding the most active people dominate.
+    parts.sort_by_key(|(_, (events, clicks))| {
+        std::cmp::Reverse(
+            events.iter().map(Vec::len).sum::<usize>() + clicks.iter().map(Vec::len).sum::<usize>(),
+        )
+    });
+    crate::write_results_scheduled(outdir, catalogs, parts, |(events, clicks)| {
+        aggregate_small(events, clicks, window, catalogs)
+    });
     Some(())
 }
 

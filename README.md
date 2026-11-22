@@ -47,7 +47,9 @@ cost: the clock runs from container start to container exit.
    qualifying time and smallest click ID determine credit. Counts per campaign
    keep each active campaign's assist contribution to one per session.
 8. **Aggregate** user days and campaign totals while walking the sessions.
-   Write the user Parquet parts in parallel, then merge the campaign totals.
+   Write the user Parquet parts in parallel, heaviest part first (the parts
+   holding the most active people would otherwise finish last), then merge
+   the campaign totals.
 
 ## Libraries
 
