@@ -254,7 +254,7 @@ struct Candidate {
 }
 
 #[inline]
-fn event_key(id: u64) -> u64 {
+pub(super) fn event_key(id: u64) -> u64 {
     // Odd multiplication modulo 2^64 and rotation are reversible. The
     // complete transformed word is still an exact event identity.
     id.wrapping_mul(0xf135_7aea_2e62_a9c5).rotate_left(26)

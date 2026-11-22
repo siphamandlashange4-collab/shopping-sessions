@@ -4,6 +4,7 @@
 //! as Parquet. Implements rules.md exactly; see that file for the spec.
 
 mod attribution;
+mod compact_spans;
 mod csv;
 mod fast;
 mod plain_parquet;
@@ -1246,13 +1247,22 @@ fn run_pipeline<F: Fact>(data: &Path, outdir: &Path, window: &Window, catalogs: 
     let links = LinkNames::build(&link_bufs);
     let (events, clicks) = rayon::join(
         || {
-            user_events::<F>(
+            compact_spans::try_events::<F>(
                 &event_bufs,
                 window,
                 &links,
                 &catalogs.products,
                 catalogs.unknown_category,
             )
+            .unwrap_or_else(|| {
+                user_events::<F>(
+                    &event_bufs,
+                    window,
+                    &links,
+                    &catalogs.products,
+                    catalogs.unknown_category,
+                )
+            })
         },
         || user_clicks(&click_bufs, window, &links, &catalogs.campaigns),
     );
