@@ -1,4 +1,4 @@
-name: Shopping Sessions independent scorer-candidate comparison
+name: Shopping Sessions variable-width ID benchmark
 on:
   create:
   push:
@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: shopping-sessions-claude-crosscheck
+  group: shopping-sessions-variable-width-bench
   cancel-in-progress: true
 jobs:
   benchmark:
@@ -22,7 +22,7 @@ jobs:
           cd ci
           git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
           git -C src worktree add --detach "$PWD/baseline" 7304c6941443e9cd98616f4d5e9f8e34ac99e7fa
-          git -C src worktree add --detach "$PWD/candidate" 80a28efa716072ae22d8eecc16448a7988f63c44
+          git -C src worktree add --detach "$PWD/candidate" 549903f46572bdf1ef4b6cca82c7e1f5c8265e4f
           docker build --platform linux/amd64 -t shopping-sessions:baseline baseline
           docker build --platform linux/amd64 -t shopping-sessions:candidate candidate
           docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' shopping-sessions:baseline shopping-sessions:candidate
