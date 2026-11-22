@@ -1,36 +1,30 @@
-name: Shopping Sessions independent scorer-candidate comparison
+name: Shopping Sessions allocation settings collaboration benchmark
 on:
-  create:
   push:
     branches: [buildathon-docker-bench]
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: shopping-sessions-claude-crosscheck
+  group: shopping-sessions-allocator-collaboration
   cancel-in-progress: true
 jobs:
   benchmark:
-    if: github.ref == 'refs/heads/buildathon-docker-bench'
     runs-on: ubuntu-24.04
     timeout-minutes: 18
     steps:
-      - name: Build both unmodified Linux images
+      - name: Build one pinned Linux image for both configurations
         shell: bash
         run: |
           mkdir ci
           cd ci
           git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
-          git -C src worktree add --detach "$PWD/baseline" 7304c6941443e9cd98616f4d5e9f8e34ac99e7fa
           git -C src worktree add --detach "$PWD/candidate" 80a28efa716072ae22d8eecc16448a7988f63c44
-          docker build --platform linux/amd64 -t shopping-sessions:baseline baseline
-          docker build --platform linux/amd64 -t shopping-sessions:candidate candidate
-          docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' shopping-sessions:baseline shopping-sessions:candidate
+          sed -i 's/^FROM rust:1-slim-bookworm AS build$/FROM rust:1.100.0-slim-bookworm AS build/' candidate/Dockerfile
+          grep -F 'FROM rust:1.100.0-slim-bookworm AS build' candidate/Dockerfile
+          docker build --platform linux/amd64 -t shopping-sessions:glibc candidate
           nproc
           lscpu | sed -n '/Model name/p'
-          if grep -qm1 avx512bw /proc/cpuinfo; then echo 'AVX-512BW available'; else echo 'AVX-512BW unavailable'; fi
-          free -h
-          df -h .
       - name: Generate official dev and synthetic practice-scale inputs
         shell: bash
         run: |
@@ -50,72 +44,75 @@ jobs:
           python3 -m venv .venv
           .venv/bin/pip install -q -r starter-polars/requirements.txt
 
-      - name: Compare exact output and time both scales
+      - name: Compare settings at eight workers and measure peak cgroup memory
         shell: bash
         run: |
           cd ci
           export CPUS=4 MEM=12g PLATFORM=linux/amd64
-          comparer=(.venv/bin/python starter-polars/scripts/compare.py)
-          runner=starter-polars/scripts/docker_run.sh
-          IMAGE=shopping-sessions:candidate .venv/bin/python starter-polars/scripts/run_fixtures.py starter-polars/fixtures -- sh "$runner"
-          for version in baseline candidate; do
-            IMAGE="shopping-sessions:$version" sh "$runner" dev "out-dev-$version"
-            "${comparer[@]}" "out-dev-$version" dev-answer
-          done
-          mkdir -m 777 timed-out timed-scratch
+          image=shopping-sessions:glibc
+          comparator=(.venv/bin/python starter-polars/scripts/compare.py)
+          baseline=glibc.malloc.hugetlb=1
+          tuned=$baseline:glibc.malloc.mmap_threshold=33554432:glibc.malloc.trim_threshold=4294967295:glibc.malloc.top_pad=67108864
+          mkdir -m 777 compare-base compare-tuned timed-output bench-scratch
+          run_container() {
+            local settings="$1" input="$2" out="$3" mode="$4"
+            local entry=/app/pipeline
+            local args=()
+            if [[ "$mode" == memory ]]; then
+              entry=/bin/sh
+              args=(-c '/app/pipeline && { printf "Peak cgroup bytes: "; cat /sys/fs/cgroup/memory.peak; printf "CPU quota: "; cat /sys/fs/cgroup/cpu.max; grep -E "^pg(maj)?fault " /sys/fs/cgroup/memory.stat; }')
+            fi
+            if [[ "$mode" == timed ]]; then
+              local timer=(/usr/bin/time -f "$input $version %e" -a -o timings.txt)
+            else
+              local timer=()
+            fi
+            "${timer[@]}" docker run --rm --platform linux/amd64 --network none --read-only \
+              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+              --security-opt no-new-privileges --pids-limit 4096 \
+              --cpus "$CPUS" --memory "$MEM" --memory-swap "$MEM" --user 1000:1000 \
+              -v "$PWD/$input":/data:ro -v "$PWD/$out":/output -v "$PWD/bench-scratch":/scratch \
+              -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e TMPDIR=/scratch \
+              -e NCPU=8 -e MEM_GB=12 -e "GLIBC_TUNABLES=$settings" \
+              --entrypoint "$entry" "$image" "${args[@]}"
+          }
+          run_container "$baseline" dev compare-base direct
+          run_container "$tuned" dev compare-tuned direct
+          "${comparator[@]}" compare-base dev-answer
+          "${comparator[@]}" compare-tuned dev-answer
+          run_container "$baseline" practice compare-base memory
+          run_container "$tuned" practice compare-tuned memory
+          "${comparator[@]}" compare-base compare-tuned
           benchmark() {
             local input="$1" cycles="$2"
-            for version in baseline candidate; do
-              IMAGE="shopping-sessions:$version" sh "$runner" "$input" "out-$input-$version"
-            done
-            "${comparer[@]}" "out-$input-baseline" "out-$input-candidate"
-            for ((cycle=1; cycle<=cycles; cycle++)); do
-              if (( cycle % 2 )); then
-                order=(baseline candidate)
+            for ((round=0; round<cycles; round++)); do
+              if (( round % 2 )); then
+                order=(tuned baseline)
               else
-                order=(candidate baseline)
+                order=(baseline tuned)
               fi
               for version in "${order[@]}"; do
-                /usr/bin/time -f "$input $version %e" -a -o timings.txt docker run --rm --platform linux/amd64 \
-                  --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
-                  --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 \
-                  --cpus "$CPUS" --memory "$MEM" --memory-swap "$MEM" --user 1000:1000 \
-                  -v "$PWD/$input":/data:ro -v "$PWD/timed-out":/output -v "$PWD/timed-scratch":/scratch \
-                  -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-                  -e NCPU="$CPUS" -e MEM_GB=12 "shopping-sessions:$version"
+                run_container "${!version}" "$input" timed-output timed
               done
             done
           }
-          benchmark practice 6
+          benchmark practice 5
           generator/target/release/generate --seed 77 --events 60000000 --clicks 15000000 --output final-data
-          benchmark final-data 4
+          echo "Final memory baseline"
+          run_container "$baseline" final-data compare-base memory
+          echo "Final memory tuned"
+          run_container "$tuned" final-data compare-tuned memory
+          "${comparator[@]}" compare-base compare-tuned
+          benchmark final-data 3
           cat timings.txt
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           from collections import defaultdict
           from statistics import median
-          times = defaultdict(list)
+          data = defaultdict(list)
           for line in open("timings.txt"):
-              dataset, name, seconds = line.split()
-              times[dataset, name].append(float(seconds))
-          for dataset in ("practice", "final-data"):
-              baseline = median(times[dataset, "baseline"])
-              candidate = median(times[dataset, "candidate"])
-              print(f"{dataset}: baseline {baseline:.3f}s, candidate {candidate:.3f}s, reduction {1-candidate/baseline:.1%}")
+              size, config, seconds = line.split()
+              data[size, config].append(float(seconds))
+          for size in ("practice", "final-data"):
+              a, b = (median(data[size, config]) for config in ("baseline", "tuned"))
+              print(f"{size}: baseline {a:.3f}s, tuned {b:.3f}s, reduction {1-b/a:.1%}")
           PY
-      - name: Check peak cgroup memory at 60M with eight workers
-        shell: bash
-        run: |
-          cd ci
-          mkdir -m 777 memory-out memory-scratch
-          for version in baseline candidate; do
-            echo "Memory check $version"
-            docker run --rm --platform linux/amd64 --network none --read-only \
-              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
-              --security-opt no-new-privileges --pids-limit 4096 \
-              --cpus 4 --memory 12g --memory-swap 12g --user 1000:1000 \
-              -v "$PWD/final-data":/data:ro -v "$PWD/memory-out":/output -v "$PWD/memory-scratch":/scratch \
-              -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-              -e NCPU=8 -e MEM_GB=12 --entrypoint /bin/sh "shopping-sessions:$version" \
-              -c '/app/run.sh && { printf "Peak cgroup bytes: "; cat /sys/fs/cgroup/memory.peak; }'
-            .venv/bin/python starter-polars/scripts/compare.py "out-final-data-$version" memory-out
-          done
