@@ -21,7 +21,7 @@ jobs:
           cd ci
           git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
           git -C src worktree add --detach "$PWD/baseline" 7304c6941443e9cd98616f4d5e9f8e34ac99e7fa
-git -C src worktree add --detach "$PWD/tuned" 27b818820305239fc9a7f9bfc16ef6227181bd88
+          git -C src worktree add --detach "$PWD/tuned" 27b818820305239fc9a7f9bfc16ef6227181bd88
           git -C src worktree add --detach "$PWD/combined" 9a751d73a6245fc1b3a35623b69be98fac1dfa59
           for version in baseline tuned combined; do
             docker build --platform linux/amd64 -t "shopping-sessions:$version" "$version"
