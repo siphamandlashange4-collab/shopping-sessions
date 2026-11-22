@@ -30,7 +30,7 @@ const SEVEN_DAYS_MS: i64 = 7 * DAY_MS;
 const LATE_MS: i64 = DAY_MS; // 24 hours
 const BAD_TS: i64 = i64::MIN;
 
-const SHARDS: usize = 32;
+const SHARDS: usize = 64;
 
 
 
