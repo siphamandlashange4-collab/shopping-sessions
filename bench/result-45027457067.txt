@@ -1,0 +1,125 @@
+4
+Model name:                              Intel(R) Xeon(R) 6975P-C
+               total        used        free      shared  buff/cache   available
+Mem:            15Gi       1.0Gi        12Gi        45Mi       2.7Gi        14Gi
+5aea742341c69e02dd08516408b7d7e453dca3ef dev vs official: MATCH
+f74acc9b9d78f51906a83fbf2515a887fbbe8e19 dev vs official: MATCH
+f74acc9b9d78f51906a83fbf2515a887fbbe8e19 practice vs 5aea742341c69e02dd08516408b7d7e453dca3ef: MATCH
+f74acc9b9d78f51906a83fbf2515a887fbbe8e19 final vs 5aea742341c69e02dd08516408b7d7e453dca3ef: MATCH
+a37d898cbafc949b76202499ef1a941826cd6b6e dev vs official: MATCH
+a37d898cbafc949b76202499ef1a941826cd6b6e practice vs 5aea742341c69e02dd08516408b7d7e453dca3ef: MATCH
+a37d898cbafc949b76202499ef1a941826cd6b6e final vs 5aea742341c69e02dd08516408b7d7e453dca3ef: MATCH
+OVERHEAD docker-true .096787026
+OVERHEAD docker-true .093830287
+OVERHEAD docker-true .090975996
+OVERHEAD docker-true .094177558
+OVERHEAD docker-true .091275592
+STAGES 5aea742 run1    0.006s  catalogs
+STAGES 5aea742 run1    0.007s  mapped inputs
+STAGES 5aea742 run1    0.200s    [branch] links built
+STAGES 5aea742 run1    1.481s    [branch] clicks parsed
+STAGES 5aea742 run1    1.881s    [branch] event candidates parsed
+STAGES 5aea742 run1    1.881s  parse joined
+STAGES 5aea742 run1    2.171s  dedup + route
+STAGES 5aea742 run1    2.515s  aggregate + user parquet
+STAGES 5aea742 run1    2.519s  campaign parquet
+STAGES 5aea742 run2    0.006s  catalogs
+STAGES 5aea742 run2    0.006s  mapped inputs
+STAGES 5aea742 run2    0.528s    [branch] event candidates parsed
+STAGES 5aea742 run2    0.661s    [branch] links built
+STAGES 5aea742 run2    0.787s    [branch] clicks parsed
+STAGES 5aea742 run2    0.787s  parse joined
+STAGES 5aea742 run2    1.069s  dedup + route
+STAGES 5aea742 run2    1.411s  aggregate + user parquet
+STAGES 5aea742 run2    1.415s  campaign parquet
+STAGES 5aea742 run3    0.006s  catalogs
+STAGES 5aea742 run3    0.006s  mapped inputs
+STAGES 5aea742 run3    0.529s    [branch] event candidates parsed
+STAGES 5aea742 run3    0.671s    [branch] links built
+STAGES 5aea742 run3    0.796s    [branch] clicks parsed
+STAGES 5aea742 run3    0.797s  parse joined
+STAGES 5aea742 run3    1.083s  dedup + route
+STAGES 5aea742 run3    1.425s  aggregate + user parquet
+STAGES 5aea742 run3    1.429s  campaign parquet
+STAGES f74acc9 run1    0.006s  catalogs
+STAGES f74acc9 run1    0.006s  mapped inputs
+STAGES f74acc9 run1    0.524s    [branch] event candidates parsed
+STAGES f74acc9 run1    0.656s    [branch] links built
+STAGES f74acc9 run1    0.778s    [branch] clicks parsed
+STAGES f74acc9 run1    0.779s  parse joined
+STAGES f74acc9 run1    1.053s  dedup + route
+STAGES f74acc9 run1    1.393s  aggregate + user parquet
+STAGES f74acc9 run1    1.397s  campaign parquet
+STAGES f74acc9 run2    0.006s  catalogs
+STAGES f74acc9 run2    0.006s  mapped inputs
+STAGES f74acc9 run2    0.528s    [branch] event candidates parsed
+STAGES f74acc9 run2    0.657s    [branch] links built
+STAGES f74acc9 run2    0.781s    [branch] clicks parsed
+STAGES f74acc9 run2    0.781s  parse joined
+STAGES f74acc9 run2    1.058s  dedup + route
+STAGES f74acc9 run2    1.399s  aggregate + user parquet
+STAGES f74acc9 run2    1.403s  campaign parquet
+STAGES f74acc9 run3    0.005s  catalogs
+STAGES f74acc9 run3    0.006s  mapped inputs
+STAGES f74acc9 run3    0.523s    [branch] event candidates parsed
+STAGES f74acc9 run3    0.652s    [branch] links built
+STAGES f74acc9 run3    0.775s    [branch] clicks parsed
+STAGES f74acc9 run3    0.776s  parse joined
+STAGES f74acc9 run3    1.045s  dedup + route
+STAGES f74acc9 run3    1.383s  aggregate + user parquet
+STAGES f74acc9 run3    1.387s  campaign parquet
+STAGES a37d898 run1    0.005s  catalogs
+STAGES a37d898 run1    0.006s  mapped inputs
+STAGES a37d898 run1    0.537s    [branch] event candidates parsed
+STAGES a37d898 run1    0.683s    [branch] links built
+STAGES a37d898 run1    0.804s    [branch] clicks parsed
+STAGES a37d898 run1    0.804s  parse joined
+STAGES a37d898 run1    1.086s  dedup + route
+STAGES a37d898 run1    1.430s  aggregate + user parquet
+STAGES a37d898 run1    1.434s  campaign parquet
+STAGES a37d898 run2    0.006s  catalogs
+STAGES a37d898 run2    0.007s  mapped inputs
+STAGES a37d898 run2    0.543s    [branch] event candidates parsed
+STAGES a37d898 run2    0.680s    [branch] links built
+STAGES a37d898 run2    0.798s    [branch] clicks parsed
+STAGES a37d898 run2    0.798s  parse joined
+STAGES a37d898 run2    1.067s  dedup + route
+STAGES a37d898 run2    1.409s  aggregate + user parquet
+STAGES a37d898 run2    1.412s  campaign parquet
+STAGES a37d898 run3    0.005s  catalogs
+STAGES a37d898 run3    0.006s  mapped inputs
+STAGES a37d898 run3    0.535s    [branch] event candidates parsed
+STAGES a37d898 run3    0.675s    [branch] links built
+STAGES a37d898 run3    0.795s    [branch] clicks parsed
+STAGES a37d898 run3    0.795s  parse joined
+STAGES a37d898 run3    1.062s  dedup + route
+STAGES a37d898 run3    1.411s  aggregate + user parquet
+STAGES a37d898 run3    1.414s  campaign parquet
+practice 5aea742341c69e02dd08516408b7d7e453dca3ef 1.659680608
+practice f74acc9b9d78f51906a83fbf2515a887fbbe8e19 1.628556901
+practice a37d898cbafc949b76202499ef1a941826cd6b6e 1.625590590
+practice f74acc9b9d78f51906a83fbf2515a887fbbe8e19 1.607199584
+practice a37d898cbafc949b76202499ef1a941826cd6b6e 1.646648576
+practice 5aea742341c69e02dd08516408b7d7e453dca3ef 1.614055053
+practice a37d898cbafc949b76202499ef1a941826cd6b6e 1.648746194
+practice 5aea742341c69e02dd08516408b7d7e453dca3ef 1.641799980
+practice f74acc9b9d78f51906a83fbf2515a887fbbe8e19 1.617202391
+practice 5aea742341c69e02dd08516408b7d7e453dca3ef 1.634928781
+practice f74acc9b9d78f51906a83fbf2515a887fbbe8e19 1.537941251
+practice a37d898cbafc949b76202499ef1a941826cd6b6e 1.614356230
+practice f74acc9b9d78f51906a83fbf2515a887fbbe8e19 1.553320443
+practice a37d898cbafc949b76202499ef1a941826cd6b6e 1.599167244
+practice 5aea742341c69e02dd08516408b7d7e453dca3ef 1.595695461
+practice a37d898cbafc949b76202499ef1a941826cd6b6e 1.621921794
+practice 5aea742341c69e02dd08516408b7d7e453dca3ef 1.625219973
+practice f74acc9b9d78f51906a83fbf2515a887fbbe8e19 1.627921981
+final 5aea742341c69e02dd08516408b7d7e453dca3ef 5.373911170
+final f74acc9b9d78f51906a83fbf2515a887fbbe8e19 5.065013743
+final a37d898cbafc949b76202499ef1a941826cd6b6e 4.940867320
+SUMMARY final 5aea742 median 5.374 min 5.374 n 1
+SUMMARY final a37d898 median 4.941 min 4.941 n 1
+SUMMARY final f74acc9 median 5.065 min 5.065 n 1
+SUMMARY practice 5aea742 median 1.630 min 1.596 n 6
+SUMMARY practice a37d898 median 1.624 min 1.599 n 6
+SUMMARY practice f74acc9 median 1.612 min 1.538 n 6
+MEMORY 5aea742341c69e02dd08516408b7d7e453dca3ef 60M peak bytes 6676168704
