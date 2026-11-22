@@ -558,11 +558,34 @@ struct SmallEvent {
     fact: CompactFact,
 }
 
-#[derive(Clone, Copy)]
-struct Candidate {
-    key: u64,
-    ingest: i64,
-    event: SmallEvent,
+/// One block of a partition's events with packed IDs, column by column:
+/// the marking pass reads only the keys, and the routing pass reads an
+/// ingest time only for an ID whose hash slot is contested.
+struct Piece {
+    keys: Vec<u64>,
+    ingests: Vec<i64>,
+    events: Vec<SmallEvent>,
+}
+
+impl Piece {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            keys: Vec::with_capacity(capacity),
+            ingests: Vec::with_capacity(capacity),
+            events: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    #[inline]
+    fn push(&mut self, key: u64, ingest: i64, event: SmallEvent) {
+        self.keys.push(key);
+        self.ingests.push(ingest);
+        self.events.push(event);
+    }
 }
 
 /// An event whose ID is a prefix and 32 hex digits, deduplicated on the
@@ -614,7 +637,7 @@ fn mark(words: &mut [u64], index: usize) -> bool {
 }
 
 fn route_partition(
-    pieces: Vec<Vec<Candidate>>,
+    pieces: Vec<Piece>,
     wide: WideCandidates,
     words: usize,
     links: &PackedLinks,
@@ -625,15 +648,17 @@ fn route_partition(
     let mask = words * 64 - 1;
     let mut seen = vec![0u64; words];
     let mut repeated = vec![0u64; words];
-    for candidate in pieces.iter().flatten() {
-        let slot = candidate.slot(mask);
-        if mark(&mut seen, slot) {
-            mark(&mut repeated, slot);
+    for piece in &pieces {
+        for &key in &piece.keys {
+            let slot = key as usize & mask;
+            if mark(&mut seen, slot) {
+                mark(&mut repeated, slot);
+            }
         }
     }
     drop(seen);
 
-    let total: usize = pieces.iter().map(Vec::len).sum();
+    let total: usize = pieces.iter().map(Piece::len).sum();
     let hex_total: usize = wide.hex.iter().map(Vec::len).sum();
     let bytes_total: usize = wide.bytes.iter().map(Vec::len).sum();
     let routed = total + hex_total + bytes_total;
@@ -644,27 +669,28 @@ fn route_partition(
     let mut winners = FxHashMap::with_capacity_and_hasher(total / 8 + 64, Default::default());
     const AHEAD: usize = 32;
     for piece in &pieces {
-        for (index, candidate) in piece.iter().enumerate() {
-            if let Some(ahead) = piece.get(index + AHEAD) {
-                prefetch_write(&repeated[ahead.slot(mask) / 64]);
-                if ahead.event.fact.valid() {
-                    links.prefetch(ahead.event.person);
+        let (keys, ingests, events) = (&piece.keys[..], &piece.ingests[..], &piece.events[..]);
+        for index in 0..keys.len() {
+            if let (Some(&ahead_key), Some(ahead)) = (keys.get(index + AHEAD), events.get(index + AHEAD)) {
+                prefetch_write(&repeated[(ahead_key as usize & mask) / 64]);
+                if ahead.fact.valid() {
+                    links.prefetch(ahead.person);
                 }
             }
-            let candidate = *candidate;
-            let slot = candidate.slot(mask);
+            let (key, event) = (keys[index], events[index]);
+            let slot = key as usize & mask;
             if repeated[slot / 64] & (1u64 << (slot % 64)) == 0 {
-                route(candidate.event, links, &mut buckets);
+                route(event, links, &mut buckets);
                 continue;
             }
-            let value = (candidate.ingest, candidate.event);
-            match winners.entry(candidate.key) {
+            let ingest = ingests[index];
+            match winners.entry(key) {
                 Entry::Vacant(entry) => {
-                    entry.insert(value);
+                    entry.insert((ingest, event));
                 }
                 Entry::Occupied(mut entry) => {
-                    if candidate.ingest < entry.get().0 {
-                        entry.insert(value);
+                    if ingest < entry.get().0 {
+                        entry.insert((ingest, event));
                     }
                 }
             }
@@ -735,14 +761,7 @@ fn route_partition(
     buckets
 }
 
-impl Candidate {
-    #[inline]
-    fn slot(&self, mask: usize) -> usize {
-        self.key as usize & mask
-    }
-}
-
-type CandidatePartitions = [Vec<Vec<Candidate>>; SHARDS];
+type CandidatePartitions = [Vec<Piece>; SHARDS];
 
 /// Candidates per block: 128 KB. Buckets grow a block at a time, so nothing
 /// is ever copied as they grow and at most one partly filled block per shard
@@ -751,8 +770,8 @@ type CandidatePartitions = [Vec<Vec<Candidate>>; SHARDS];
 const BLOCK: usize = 4096;
 
 struct Blocks {
-    current: [Vec<Candidate>; SHARDS],
-    full: [Vec<Vec<Candidate>>; SHARDS],
+    current: [Piece; SHARDS],
+    full: [Vec<Piece>; SHARDS],
     hex: [Vec<HexCandidate>; SHARDS],
     long: [Vec<LongCandidate>; SHARDS],
     sink: LongSink,
@@ -761,7 +780,7 @@ struct Blocks {
 impl Blocks {
     fn new() -> Self {
         Self {
-            current: std::array::from_fn(|_| Vec::with_capacity(BLOCK)),
+            current: std::array::from_fn(|_| Piece::with_capacity(BLOCK)),
             full: std::array::from_fn(|_| Vec::new()),
             hex: std::array::from_fn(|_| Vec::new()),
             long: std::array::from_fn(|_| Vec::new()),
@@ -770,11 +789,11 @@ impl Blocks {
     }
 
     #[inline]
-    fn push(&mut self, shard: usize, candidate: Candidate) {
+    fn push(&mut self, shard: usize, key: u64, ingest: i64, event: SmallEvent) {
         let current = &mut self.current[shard];
-        current.push(candidate);
+        current.push(key, ingest, event);
         if current.len() == BLOCK {
-            let block = std::mem::replace(current, Vec::with_capacity(BLOCK));
+            let block = std::mem::replace(current, Piece::with_capacity(BLOCK));
             self.full[shard].push(block);
         }
     }
@@ -798,13 +817,13 @@ impl Blocks {
     fn finish(
         mut self,
     ) -> (
-        [Vec<Vec<Candidate>>; SHARDS],
+        [Vec<Piece>; SHARDS],
         [Vec<HexCandidate>; SHARDS],
         [Vec<LongCandidate>; SHARDS],
         LongSink,
     ) {
         for (full, current) in self.full.iter_mut().zip(self.current) {
-            if !current.is_empty() {
+            if current.len() != 0 {
                 full.push(current);
             }
         }
@@ -861,7 +880,7 @@ fn collect_candidates(
                     match pack::<b'e'>(id) {
                         Some(id) => {
                             let key = event_key(id);
-                            possible.push(shard(key), Candidate { key, ingest, event });
+                            possible.push(shard(key), key, ingest, event);
                         }
                         None => possible.push_wide(id, ingest, event),
                     }
@@ -1280,22 +1299,16 @@ mod tests {
 
     #[test]
     fn hash_slot_collisions_keep_distinct_ids_and_earliest_copies() {
-        let candidate = |key, ingest, fact| Candidate {
-            key,
-            ingest,
-            event: SmallEvent { person: PackedName(11), fact },
+        let piece = |rows: &[(u64, i64, CompactFact)]| {
+            let mut piece = Piece::with_capacity(rows.len());
+            for &(key, ingest, fact) in rows {
+                piece.push(key, ingest, SmallEvent { person: PackedName(11), fact });
+            }
+            piece
         };
         let pieces = vec![
-            vec![
-                candidate(10, 20, CompactFact(100)),
-                candidate(74, 30, CompactFact(200)),
-                candidate(11, 40, CompactFact(300)),
-            ],
-            vec![
-                candidate(10, 10, CompactFact::INVALID),
-                candidate(74, 15, CompactFact(400)),
-                candidate(138, 20, CompactFact(500)),
-            ],
+            piece(&[(10, 20, CompactFact(100)), (74, 30, CompactFact(200)), (11, 40, CompactFact(300))]),
+            piece(&[(10, 10, CompactFact::INVALID), (74, 15, CompactFact(400)), (138, 20, CompactFact(500))]),
         ];
         let links = PackedLinks::with_capacity(16);
         let long_candidate = |id, ingest, fact| LongCandidate {
