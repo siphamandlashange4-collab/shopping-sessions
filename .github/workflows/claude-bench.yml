@@ -123,11 +123,11 @@ jobs:
               print(f"SUMMARY {d} {s[:7]} median {median(xs):.3f} min {min(xs):.3f} n {len(xs)}")
           PY
           for sha in "${SHAS[@]}"; do
-            rm -rf memory-out; mkdir -m 777 memory-out
+            mkdir -m 777 "memory-out-$sha"
             docker run --rm --platform linux/amd64 --network none --read-only \
               --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges \
               --pids-limit 4096 --cpus "$CPUS" --memory 14g --memory-swap 14g --user 1000:1000 \
-              -v "$PWD/final":/data:ro -v "$PWD/memory-out":/output -v "$PWD/scratch":/scratch \
+              -v "$PWD/final":/data:ro -v "$PWD/memory-out-$sha":/output -v "$PWD/scratch":/scratch \
               -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
               -e NCPU=8 -e MEM_GB=14 --entrypoint /bin/sh "ss:$sha" \
               -c '/app/run.sh && cat /sys/fs/cgroup/memory.peak' > mem.txt
