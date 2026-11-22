@@ -25,9 +25,11 @@ pub struct Click {
 pub fn id_order(id: &[u8]) -> u64 {
     match id {
         [b'k', suffix @ ..] if (1..=8).contains(&suffix.len()) && !suffix.contains(&0) => {
-            let mut bytes = [0u8; 8];
-            bytes[..suffix.len()].copy_from_slice(suffix);
-            u64::from_be_bytes(bytes)
+            match <[u8; 8]>::try_from(suffix) {
+                Ok(bytes) => u64::from_be_bytes(bytes),
+                // Zero-padded big-endian is the byte swap of little-endian.
+                Err(_) => crate::fast::small_le(suffix).swap_bytes(),
+            }
         }
         _ => 0,
     }

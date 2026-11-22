@@ -18,6 +18,27 @@ const UPPER_CASE: u64 = 1 << 63;
 #[derive(Clone, Copy, Default, Eq, Hash, PartialEq)]
 struct PackedName(u64);
 
+/// Up to seven bytes as a little-endian word, zero-padded. Two overlapping
+/// loads instead of a variable-length copy, which would be a call.
+#[inline]
+pub(super) fn small_le(bytes: &[u8]) -> u64 {
+    let len = bytes.len();
+    debug_assert!(len < 8);
+    if len >= 4 {
+        let low = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64;
+        let high = u32::from_le_bytes(bytes[len - 4..].try_into().unwrap()) as u64;
+        low | (high << ((len - 4) * 8))
+    } else if len >= 2 {
+        let low = u16::from_le_bytes(bytes[..2].try_into().unwrap()) as u64;
+        let high = u16::from_le_bytes(bytes[len - 2..].try_into().unwrap()) as u64;
+        low | (high << ((len - 2) * 8))
+    } else if len == 1 {
+        bytes[0] as u64
+    } else {
+        0
+    }
+}
+
 #[inline]
 fn pack<const PREFIX: u8>(id: &[u8]) -> Option<u64> {
     let (&first, suffix) = id.split_first()?;
@@ -35,9 +56,7 @@ fn pack<const PREFIX: u8>(id: &[u8]) -> Option<u64> {
     let value = if let Ok(bytes) = <[u8; 8]>::try_from(suffix) {
         u64::from_le_bytes(bytes)
     } else if suffix.len() < 8 {
-        let mut bytes = [0; 8];
-        bytes[..suffix.len()].copy_from_slice(suffix);
-        u64::from_le_bytes(bytes)
+        small_le(suffix)
     } else {
         return None;
     };
@@ -389,7 +408,15 @@ pub(super) struct PackedLinks {
     slots: Vec<[u64; 2]>,
     shift: u32,
     len: usize,
+    /// A blocked Bloom filter of the linked names: each sets two bits of one
+    /// word. A name missing either bit is linked to nothing, so lookups for
+    /// unlinked people (about two in five) read this small array instead of
+    /// a line of the much larger table.
+    filter: Vec<u64>,
+    filter_shift: u32,
 }
+
+const FILTER_MUL: u64 = 0xd6e8_feb8_6659_fd93;
 
 impl PackedLinks {
     fn with_capacity(names: usize) -> Self {
@@ -400,7 +427,39 @@ impl PackedLinks {
             slots: vec![[0, 0]; cap],
             shift: 64 - cap.trailing_zeros(),
             len: 0,
+            // Until `finish_filter` runs, every name may be linked.
+            filter: vec![u64::MAX; 2],
+            filter_shift: 63,
         }
+    }
+
+    /// Record every linked name in the filter: about 14 bits per name, so
+    /// roughly one unlinked name in fifty still has to read the table.
+    fn finish_filter(&mut self) {
+        let words = (self.len * 14 / 64 + 2).next_power_of_two();
+        self.filter = vec![0; words];
+        self.filter_shift = 64 - words.trailing_zeros();
+        for slot in 0..self.slots.len() {
+            let key = self.slots[slot][0];
+            if key != 0 {
+                let (word, bits) = self.filter_slot(key);
+                self.filter[word] |= bits;
+            }
+        }
+    }
+
+    #[inline]
+    fn filter_slot(&self, key: u64) -> (usize, u64) {
+        let h = key.wrapping_mul(FILTER_MUL);
+        let bits = (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63));
+        ((h >> self.filter_shift) as usize, bits)
+    }
+
+    #[inline]
+    fn maybe_linked(&self, key: u64) -> bool {
+        let (word, bits) = self.filter_slot(key);
+        // `word` is the top bits of the hash, always below the filter length.
+        unsafe { *self.filter.get_unchecked(word) & bits == bits }
     }
 
     /// Double the table. Only reached when the IDs are far more distinct
@@ -450,15 +509,20 @@ impl PackedLinks {
         }
     }
 
+    /// Bring the table line for `name` into cache, unless the filter says
+    /// the name is not linked; then touch the (cached) filter word instead.
     #[inline]
     fn prefetch(&self, name: PackedName) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch(
+            let (word, _) = self.filter_slot(name.0);
+            let line = std::hint::select_unpredictable(
+                self.maybe_linked(name.0),
                 self.slots.as_ptr().add(self.home(name.0)).cast::<i8>(),
-                _MM_HINT_T0,
+                self.filter.as_ptr().add(word).cast::<i8>(),
             );
+            _mm_prefetch(line, _MM_HINT_T0);
         }
     }
 
@@ -531,11 +595,15 @@ impl PackedLinks {
                 slot[1] = smallest[find_root(&mut parent, slot[1] as u32) as usize].0;
             }
         }
+        links.finish_filter();
         Some((links, long_names))
     }
 
     #[inline]
     fn canonical(&self, name: PackedName) -> PackedName {
+        if !self.maybe_linked(name.0) {
+            return name;
+        }
         let mask = self.slots.len() - 1;
         let mut i = self.home(name.0);
         loop {
@@ -1102,18 +1170,24 @@ fn aggregate_small(
             start
         })
         .collect();
-    let mut events = vec![CompactFact::default(); len];
+    // Every slot is written exactly once below: the ranges come from the
+    // same counts, so there is no need to zero the vector first.
+    let mut events: Vec<CompactFact> = Vec::with_capacity(len);
+    let slots = &mut events.spare_capacity_mut()[..len];
     for piece in parts.iter() {
         for index in 0..piece.len() {
             if let Some(ahead) = piece.get(index + AHEAD) {
-                prefetch_write(&events[offsets[ahead.person.0 as usize].min(len - 1)]);
+                prefetch_write(&slots[offsets[ahead.person.0 as usize].min(len - 1)]);
             }
             let event = piece[index];
             let person = event.person.0 as usize;
-            events[offsets[person]] = event.fact;
+            slots[offsets[person]].write(event.fact);
             offsets[person] += 1;
         }
     }
+    // SAFETY: the counts give each person a range of exactly its own events,
+    // and the ranges tile 0..len, so all `len` slots were written.
+    unsafe { events.set_len(len) };
     drop(parts);
 
     let mut grouped = Vec::with_capacity(clicks.iter().map(Vec::len).sum());
@@ -1266,6 +1340,16 @@ mod tests {
         assert!(a != b && a != c && b != c);
         assert_eq!(hex_id(b"u10000000000000000000000000000000").unwrap().digits, [1, 0]);
         assert_eq!(hex_id(b"u00000000000000000000000000000001").unwrap().digits, [0, 1 << 60]);
+    }
+
+    #[test]
+    fn small_words_match_a_padded_copy() {
+        let text = b"abcdefg";
+        for len in 0..8 {
+            let mut padded = [0u8; 8];
+            padded[..len].copy_from_slice(&text[..len]);
+            assert_eq!(small_le(&text[..len]), u64::from_le_bytes(padded));
+        }
     }
 
     #[test]
