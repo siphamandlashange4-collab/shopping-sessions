@@ -1,4 +1,4 @@
-name: Shopping Sessions vectored Parquet benchmark
+name: Shopping Sessions independent scorer-candidate comparison
 on:
   create:
   push:
@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: shopping-sessions-vectored-output-bench
+  group: shopping-sessions-claude-crosscheck
   cancel-in-progress: true
 jobs:
   benchmark:
@@ -21,8 +21,8 @@ jobs:
           mkdir ci
           cd ci
           git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" src
-          git -C src worktree add --detach "$PWD/baseline" 80a86150b180280c1cd5115ffc0985add9532ef5
-          git -C src worktree add --detach "$PWD/candidate" da3a5d6ced8bcda08409c6beafb53411fb90ac13
+          git -C src worktree add --detach "$PWD/baseline" 7304c6941443e9cd98616f4d5e9f8e34ac99e7fa
+          git -C src worktree add --detach "$PWD/candidate" 80a28efa716072ae22d8eecc16448a7988f63c44
           docker build --platform linux/amd64 -t shopping-sessions:baseline baseline
           docker build --platform linux/amd64 -t shopping-sessions:candidate candidate
           docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' shopping-sessions:baseline shopping-sessions:candidate
@@ -102,3 +102,20 @@ jobs:
               candidate = median(times[dataset, "candidate"])
               print(f"{dataset}: baseline {baseline:.3f}s, candidate {candidate:.3f}s, reduction {1-candidate/baseline:.1%}")
           PY
+      - name: Check peak cgroup memory at 60M with eight workers
+        shell: bash
+        run: |
+          cd ci
+          mkdir -m 777 memory-out memory-scratch
+          for version in baseline candidate; do
+            echo "Memory check $version"
+            docker run --rm --platform linux/amd64 --network none --read-only \
+              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+              --security-opt no-new-privileges --pids-limit 4096 \
+              --cpus 4 --memory 12g --memory-swap 12g --user 1000:1000 \
+              -v "$PWD/final-data":/data:ro -v "$PWD/memory-out":/output -v "$PWD/memory-scratch":/scratch \
+              -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+              -e NCPU=8 -e MEM_GB=12 --entrypoint /bin/sh "shopping-sessions:$version" \
+              -c '/app/run.sh && { printf "Peak cgroup bytes: "; cat /sys/fs/cgroup/memory.peak; }'
+            .venv/bin/python starter-polars/scripts/compare.py "out-final-data-$version" memory-out
+          done
