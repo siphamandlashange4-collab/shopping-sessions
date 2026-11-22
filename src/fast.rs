@@ -391,6 +391,9 @@ pub(super) struct PackedLinks {
     len: usize,
 }
 
+/// Link lines as packed name pairs, and the text behind every long name.
+type LinkPairs = (Vec<Vec<(PackedName, PackedName)>>, Vec<Vec<(u64, LongText)>>);
+
 impl PackedLinks {
     fn with_capacity(names: usize) -> Self {
         // At most about 40% full: a large share of the people in the events
@@ -464,10 +467,16 @@ impl PackedLinks {
 
     /// The link table and the text of every long name in the links. None
     /// when two distinct linked IDs share a long name.
+    #[cfg(test)]
     fn build(
         buffers: &[&'static [u8]],
     ) -> Option<(Self, FxHashMap<u64, LongText>)> {
-        let (parts, long_parts): (Vec<_>, Vec<_>) = chunks(buffers)
+        Self::join(Self::pairs(buffers))
+    }
+
+    /// Reads every link line into name pairs, in parallel.
+    fn pairs(buffers: &[&'static [u8]]) -> LinkPairs {
+        chunks(buffers)
             .into_par_iter()
             .map(|chunk| {
                 let mut pairs = Vec::new();
@@ -489,7 +498,11 @@ impl PackedLinks {
                 });
                 (pairs, long)
             })
-            .unzip();
+            .unzip()
+    }
+
+    /// Joins the pairs into people. Serial: run it beside other work.
+    fn join((parts, long_parts): LinkPairs) -> Option<(Self, FxHashMap<u64, LongText>)> {
         let mut long_names: FxHashMap<u64, LongText> = FxHashMap::default();
         for (name, text) in long_parts.into_iter().flatten() {
             if *long_names.entry(name).or_insert(text) != text {
@@ -619,6 +632,15 @@ fn event_key(id: u64) -> u64 {
     id.wrapping_mul(0xf135_7aea_2e62_a9c5).rotate_left(26)
 }
 
+/// One worker's clicks: a scratch buffer for the chunk being parsed and the
+/// clicks routed so far, by person shard.
+struct ClickBuckets {
+    parsed: Vec<SmallClick>,
+    people: [Vec<SmallClick>; SHARDS],
+    sink: LongSink,
+}
+
+#[derive(Clone, Copy)]
 struct SmallClick {
     person: PackedName,
     offset_ms: i32,
@@ -845,51 +867,42 @@ fn collect_candidates(
         .next_power_of_two();
 
     // Parse the CSV once and move compact rows by event ID before routing
-    // them by person. Same-ID copies always reach the same partition.
-    // `fold` keeps one set of buckets per stolen piece of work, so every
-    // thread pulls 2 MB chunks until the input runs out instead of owning a
-    // fixed share of it.
-    let pieces = chunks
-        .par_iter()
-        .fold(
-            || Some(Blocks::new()),
-            |possible, &chunk| {
-                let mut possible = possible?;
-                let ok = csv::for_each::<7>(chunk, |[id, person, time, ingest, kind, product, price]| {
-                    if id.is_empty() {
-                        return true;
-                    }
-                    let ingest = ts::parse_ingest(ingest).unwrap_or(BAD_TS);
-                    let fact = event_fact::<CompactFact, _>(
-                        window,
-                        &catalogs.product_ids,
-                        catalogs.unknown_category,
-                        person,
-                        time,
-                        ingest,
-                        kind,
-                        product,
-                        price,
-                    );
-                    let person = if fact.valid() {
-                        PackedName::of(person, &mut possible.sink)
-                    } else {
-                        PackedName::default()
-                    };
-                    let event = SmallEvent { person, fact };
-                    match pack::<b'e'>(id) {
-                        Some(id) => {
-                            let key = event_key(id);
-                            possible.push(shard(key), key, ingest, event);
-                        }
-                        None => possible.push_wide(id, ingest, event),
-                    }
-                    true
-                });
-                ok.then_some(possible)
-            },
-        )
-        .collect::<Option<Vec<_>>>()?;
+    // them by person. Same-ID copies always reach the same partition. Every
+    // thread pulls 2 MB chunks until the input runs out and fills one set of
+    // blocks of its own.
+    let pieces = crate::per_thread(&chunks, Blocks::new, |possible, &chunk| {
+        csv::for_each::<7>(chunk, |[id, person, time, ingest, kind, product, price]| {
+            if id.is_empty() {
+                return true;
+            }
+            let ingest = ts::parse_ingest(ingest).unwrap_or(BAD_TS);
+            let fact = event_fact::<CompactFact, _>(
+                window,
+                &catalogs.product_ids,
+                catalogs.unknown_category,
+                person,
+                time,
+                ingest,
+                kind,
+                product,
+                price,
+            );
+            let person = if fact.valid() {
+                PackedName::of(person, &mut possible.sink)
+            } else {
+                PackedName::default()
+            };
+            let event = SmallEvent { person, fact };
+            match pack::<b'e'>(id) {
+                Some(id) => {
+                    let key = event_key(id);
+                    possible.push(shard(key), key, ingest, event);
+                }
+                None => possible.push_wide(id, ingest, event),
+            }
+            true
+        })
+    })?;
 
     let mut partitions: CandidatePartitions = std::array::from_fn(|_| Vec::new());
     let mut wide: WidePartitions = std::array::from_fn(|_| WideCandidates::default());
@@ -927,13 +940,22 @@ fn collect_clicks(
     links: &PackedLinks,
 ) -> Option<([Vec<Vec<SmallClick>>; SHARDS], Vec<LongSink>)> {
     let start = window.start - SEVEN_DAYS_MS;
-    let (pieces, sinks): (Vec<_>, Vec<_>) = chunks(buffers)
-        .into_par_iter()
-        .map(|chunk| {
+    let chunks = chunks(buffers);
+    let bytes: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+    let threads = rayon::current_num_threads().max(1);
+    let per_shard = bytes / 48 / threads / SHARDS * 5 / 4 + 64;
+    let accumulators = crate::per_thread(
+        &chunks,
+        || ClickBuckets {
+            parsed: Vec::new(),
+            people: std::array::from_fn(|_| Vec::with_capacity(per_shard)),
+            sink: LongSink::new(),
+        },
+        |acc, &chunk| {
             // Parse first, then resolve people in a second pass where the
-            // link slot for a click sixteen rows ahead is already in flight.
-            let mut parsed: Vec<SmallClick> = Vec::with_capacity(chunk.len() / 40);
-            let mut sink = LongSink::new();
+            // link slot for a click 32 rows ahead is already in flight.
+            let ClickBuckets { parsed, people, sink } = acc;
+            parsed.clear();
             csv::for_each::<4>(chunk, |[id, person, campaign, time]| {
                 if id.is_empty() || person.is_empty() {
                     return true;
@@ -946,7 +968,7 @@ fn collect_clicks(
                 else {
                     return true;
                 };
-                let person = PackedName::of(person, &mut sink);
+                let person = PackedName::of(person, sink);
                 parsed.push(SmallClick {
                     person,
                     // The compact window has at most 2^31 milliseconds, and
@@ -958,23 +980,20 @@ fn collect_clicks(
                 });
                 true
             });
-            let mut people: [Vec<SmallClick>; SHARDS] =
-                std::array::from_fn(|_| Vec::with_capacity(parsed.len() / SHARDS * 5 / 4 + 16));
             const AHEAD: usize = 32;
             for index in 0..parsed.len() {
                 if let Some(ahead) = parsed.get(index + AHEAD) {
                     links.prefetch(ahead.person);
                 }
-                let mut click = std::mem::replace(
-                    &mut parsed[index],
-                    SmallClick { person: PackedName(0), offset_ms: 0, campaign: 0, id: b"", order: 0 },
-                );
+                let mut click = parsed[index];
                 click.person = links.canonical(click.person);
                 people[person_shard(click.person.0)].push(click);
             }
-            (people, sink)
-        })
-        .unzip();
+            true
+        },
+    )?;
+    let (pieces, sinks): (Vec<_>, Vec<_>) =
+        accumulators.into_iter().map(|acc| (acc.people, acc.sink)).unzip();
     Some((exchange(pieces), sinks))
 }
 
@@ -1165,20 +1184,26 @@ pub(super) fn try_pipeline(
     catalogs: &Catalogs,
     outdir: &Path,
 ) -> Option<()> {
-    // Parsing event candidates only needs the catalogs. Build the link
-    // components and parse clicks in parallel, then route the dedup winners.
-    let (candidates, linked_clicks) = rayon::join(
+    // Link lines are few: read them on every thread first. Joining them
+    // into people is serial, so it runs on this thread while the others parse
+    // event candidates, which only need the catalogs. Clicks need the people
+    // and follow on whichever threads come free. Started the other way round,
+    // the link chunks would queue behind every event chunk and leave the
+    // serial join on the critical path.
+    let pairs = PackedLinks::pairs(link_bufs);
+    crate::lap("link pairs read");
+    let (linked_clicks, candidates) = rayon::join(
         || {
-            let r = collect_candidates(event_bufs, window, catalogs);
-            crate::lap("  [branch] event candidates parsed");
-            r
-        },
-        || {
-            let (links, long_links) = PackedLinks::build(link_bufs)?;
+            let (links, long_links) = PackedLinks::join(pairs)?;
             crate::lap("  [branch] links built");
             let (clicks, click_sinks) = collect_clicks(click_bufs, window, catalogs, &links)?;
             crate::lap("  [branch] clicks parsed");
             Some((links, long_links, clicks, click_sinks))
+        },
+        || {
+            let r = collect_candidates(event_bufs, window, catalogs);
+            crate::lap("  [branch] event candidates parsed");
+            r
         },
     );
     crate::lap("parse joined");

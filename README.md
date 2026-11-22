@@ -15,7 +15,8 @@ cost: the clock runs from container start to container exit.
 1. **Read** all input files as borrowed byte ranges. On Linux, large immutable
    logs are mapped read-only so workers can scan them without a heap copy.
 2. **Parse** events and clicks in parallel over 2 MB line-aligned chunks,
-   each thread pulling chunks until the input runs out, with a
+   each thread pulling chunks until the input runs out and filling one set of
+   buffers of its own, with a
    hand-written CSV reader matching the spec's dialect exactly: `\n` only ends a
    line, `\r` is an ordinary character, quotes are syntax only when they wrap a
    whole field, and any other quote or a wrong field count makes the line
@@ -39,7 +40,9 @@ cost: the clock runs from container start to container exit.
    stored in a flat open-addressed table, kept at most about 40% full so a
    lookup for an unlinked ID ends quickly, where the slot for an event or
    click 32 rows ahead can be prefetched while the current one is routed.
-   Events and clicks are routed by that name.
+   Events and clicks are routed by that name. The link lines are read first
+   on every thread; the serial union-find then runs on one thread while the
+   others parse events, so it never holds up the run.
 6. **Sessionize** in parallel by person shard. Group events and clicks by person
    in linear time, then sort each person's slices by timestamp. Start a new
    session when the gap exceeds 30 minutes.

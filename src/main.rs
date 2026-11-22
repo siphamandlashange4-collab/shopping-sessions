@@ -502,6 +502,43 @@ fn chunks(buffers: &[&'static [u8]]) -> Vec<&'static [u8]> {
 
 type Buckets<T> = [Vec<T>; SHARDS];
 
+/// Runs `work` on every item in parallel with one accumulator per worker
+/// thread. However rayon splits the list, each thread fills a single set of
+/// buffers, created on its first item. Returns None if any call failed.
+fn per_thread<I: Sync, T: Send>(
+    items: &[I],
+    make: impl Fn() -> T + Sync,
+    work: impl Fn(&mut T, &I) -> bool + Sync,
+) -> Option<Vec<T>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let threads = rayon::current_num_threads();
+    let slots: Vec<std::sync::Mutex<Option<T>>> =
+        (0..=threads).map(|_| std::sync::Mutex::new(None)).collect();
+    let failed = AtomicBool::new(false);
+    items.par_iter().for_each(|item| {
+        if failed.load(Ordering::Relaxed) {
+            return;
+        }
+        // `work` never calls back into rayon, so a worker can't be handed
+        // another item while it holds its own slot.
+        let index = rayon::current_thread_index().map_or(threads, |index| index.min(threads));
+        let mut slot = slots[index].lock().unwrap_or_else(|poison| poison.into_inner());
+        let accumulator = slot.get_or_insert_with(&make);
+        if !work(accumulator, item) {
+            failed.store(true, Ordering::Relaxed);
+        }
+    });
+    if failed.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(
+        slots
+            .into_iter()
+            .filter_map(|slot| slot.into_inner().unwrap_or_else(|poison| poison.into_inner()))
+            .collect(),
+    )
+}
+
 /// Exchange whole vectors so workers can consume one shard without locks.
 fn exchange<T>(buckets: Vec<Buckets<T>>) -> [Vec<Vec<T>>; SHARDS] {
     let mut shards = std::array::from_fn(|_| Vec::with_capacity(buckets.len()));
