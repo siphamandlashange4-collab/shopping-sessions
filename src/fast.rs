@@ -78,24 +78,11 @@ impl OutputName for PackedName {
     }
 
     fn write_plain(path: &Path, rows: &UserRows<Self>) -> bool {
-        // This bounds the size of a plain page independently of the number
-        // of repeated category values. The general writer handles longer text.
-        if rows.category.iter().flatten().any(|text| text.len() > 4096) {
-            return false;
-        }
-        let mut table = crate::plain_parquet::UserTable::new(rows.names.len());
-        table.names(&rows.names, Self::text_len, |name, bytes| {
+        crate::plain_parquet::write_user_table(path, rows, Self::text_len, |name, bytes| {
             let suffix = (name.0 & !UPPER_CASE).to_le_bytes();
             bytes.push(if name.0 & UPPER_CASE == 0 { b'u' } else { b'U' });
             bytes.extend_from_slice(&suffix[..name.text_len() - 1]);
-        });
-        table.day(&rows.day);
-        table.integer("sessions", &rows.sessions);
-        table.integer("events", &rows.events);
-        table.integer("revenue_cents", &rows.revenue);
-        table.categories(&rows.category);
-        table.finish(path);
-        true
+        })
     }
 }
 
@@ -282,7 +269,7 @@ struct SmallClick {
 }
 
 #[inline]
-fn mark(words: &mut [u64], index: usize) -> bool {
+pub(super) fn mark(words: &mut [u64], index: usize) -> bool {
     let bit = 1_u64 << (index % 64);
     let word = &mut words[index / 64];
     let already_set = *word & bit != 0;

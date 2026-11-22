@@ -8,6 +8,29 @@ use parquet::format::{
 };
 use parquet::thrift::{TCompactOutputProtocol, TSerializable};
 
+use super::UserRows;
+
+pub(super) fn write_user_table<N: Copy>(
+    path: &Path,
+    rows: &UserRows<N>,
+    length: impl Fn(N) -> usize,
+    encode: impl Fn(N, &mut Vec<u8>),
+) -> bool {
+    // Keep a plain page's payload size within its signed 32-bit header.
+    if rows.category.iter().flatten().any(|text| text.len() > 4096) {
+        return false;
+    }
+    let mut table = UserTable::new(rows.names.len());
+    table.names(&rows.names, length, encode);
+    table.day(&rows.day);
+    table.integer("sessions", &rows.sessions);
+    table.integer("events", &rows.events);
+    table.integer("revenue_cents", &rows.revenue);
+    table.categories(&rows.category);
+    table.finish(path);
+    true
+}
+
 const MAGIC: &[u8; 4] = b"PAR1";
 const PAGE_ROWS: usize = 65_536;
 

@@ -651,9 +651,9 @@ fn user_events<F: Fact>(
                 std::array::from_fn(|_| Vec::new());
             let mut fallback_buckets: Buckets<Candidate<&[u8], F>> =
                 std::array::from_fn(|_| Vec::new());
-            for [id, user, time, ingest, kind, product, price] in csv::Rows::<7>::raw(chunk) {
+            csv::for_each::<7>(chunk, |[id, user, time, ingest, kind, product, price]| {
                 if id.is_empty() {
-                    continue;
+                    return true;
                 }
                 let ingest = ts::parse(ingest).unwrap_or(BAD_TS);
                 let fact = event_fact(
@@ -673,7 +673,8 @@ fn user_events<F: Fact>(
                         event,
                     });
                 }
-            }
+                true
+            });
             (packed_buckets, fallback_buckets)
         })
         .unzip();
@@ -697,48 +698,51 @@ fn route_winners<K: std::hash::Hash + Eq + Copy, F: Fact>(
     buckets: &mut Buckets<Event<F>>,
 ) {
     use std::collections::hash_map::Entry;
-    let mut total = 0;
-    let offsets: Vec<_> = pieces
-        .iter()
-        .map(|piece| {
-            let offset = total;
-            total += piece.len();
-            offset
-        })
-        .collect();
-    // Access another row only when its ID actually repeats. Keep the large
-    // candidate scan sequential and the hash-table values eight bytes wide.
-    let mut dropped = vec![false; total];
-    let mut winners: FxHashMap<K, (u32, u32)> =
-        FxHashMap::with_capacity_and_hasher(total, Default::default());
-    for (piece, rows) in pieces.iter().enumerate() {
-        for (row, candidate) in rows.iter().enumerate() {
-            let current = (piece as u32, row as u32);
-            match winners.entry(candidate.id) {
-                Entry::Vacant(entry) => {
-                    entry.insert(current);
-                }
-                Entry::Occupied(mut entry) => {
-                    let &(prior_piece, prior_row) = entry.get();
-                    let (a, b) = (prior_piece as usize, prior_row as usize);
-                    if candidate.ingest < pieces[a][b].ingest {
-                        dropped[offsets[a] + b] = true;
-                        entry.insert(current);
-                    } else {
-                        dropped[offsets[piece] + row] = true;
-                    }
-                }
-            }
+
+    let total = pieces.iter().map(Vec::len).sum::<usize>();
+    if total == 0 {
+        return;
+    }
+    // Equal IDs always hit the same slot. A contested slot still uses an
+    // exact ID comparison, so a hash collision cannot drop an event.
+    let slots = total.saturating_mul(8).clamp(64, 1 << 29).next_power_of_two();
+    let mut seen = vec![0; slots / 64];
+    let mut contested = vec![0; slots / 64];
+    let slot_of = |id| rustc_hash::FxBuildHasher.hash_one(id) as usize & (slots - 1);
+    for candidate in pieces.iter().flatten() {
+        let slot = slot_of(candidate.id);
+        if fast::mark(&mut seen, slot) {
+            fast::mark(&mut contested, slot);
         }
     }
-    drop(winners);
-    for (candidate, dropped) in pieces.iter().flatten().zip(dropped) {
-        let mut event = candidate.event;
-        if !dropped && event.fact.valid() {
+
+    let mut route = |mut event: Event<F>| {
+        if event.fact.valid() {
             let (user, group) = links.route(event.user);
             event.user = user;
             buckets[group].push(event);
         }
+    };
+    let mut winners = FxHashMap::with_capacity_and_hasher(total / 8, Default::default());
+    for candidate in pieces.iter().flatten() {
+        let slot = slot_of(candidate.id);
+        if contested[slot / 64] & (1_u64 << (slot % 64)) == 0 {
+            route(candidate.event);
+            continue;
+        }
+        match winners.entry(candidate.id) {
+            Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            Entry::Occupied(mut entry) => {
+                if candidate.ingest < entry.get().ingest {
+                    entry.insert(candidate);
+                }
+            }
+        }
+    }
+    for winner in winners.into_values() {
+        route(winner.event);
     }
 }
 
@@ -753,18 +757,18 @@ fn user_clicks(
         .into_par_iter()
         .map(|chunk| {
             let mut buckets = std::array::from_fn(|_| Vec::new());
-            for [id, user, campaign, time] in csv::Rows::<4>::raw(chunk) {
+            csv::for_each::<4>(chunk, |[id, user, campaign, time]| {
                 if id.is_empty() || user.is_empty() {
-                    continue;
+                    return true;
                 }
                 let Some(time) = ts::parse(time) else {
-                    continue;
+                    return true;
                 };
                 if !(click_start..window.end).contains(&time) {
-                    continue;
+                    return true;
                 }
                 let Some(campaign) = campaigns.get(campaign).filter(|&id| id != ORGANIC) else {
-                    continue;
+                    return true;
                 };
                 let (user, group) = links.route(user);
                 // Identical click copies have the same attribution tie-break and
@@ -775,7 +779,8 @@ fn user_clicks(
                     time,
                     campaign,
                 });
-            }
+                true
+            });
             buckets
         })
         .collect();
@@ -813,6 +818,15 @@ trait OutputName: Copy + Default + Send {
 impl OutputName for &'static str {
     fn string_array(names: Vec<Self>) -> StringArray {
         StringArray::from_iter_values(names)
+    }
+
+    fn write_plain(path: &Path, rows: &UserRows<Self>) -> bool {
+        if rows.names.iter().any(|name| name.len() > 4096) {
+            return false;
+        }
+        plain_parquet::write_user_table(path, rows, str::len, |name, bytes| {
+            bytes.extend_from_slice(name.as_bytes());
+        })
     }
 }
 
